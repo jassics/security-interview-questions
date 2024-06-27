@@ -28,12 +28,12 @@ If you are new to this domain or planning to make a career in cybersecurity. You
 
 __They are:__
 
-1. Common Skills Study Plan that you can finish within 3 months
-2. 20 Essential books that you should read from security world
-3. Application Security Study Plan (You must go through it before trying for appsec interviews)
-4. You can’t ignore API security at present. So, here is your API Security Study Plan
+1. [Common Skills Study Plan](https://jassics.medium.com/study-plan-to-learn-common-skills-in-cybersecurity-865d15e28c46) that you can finish within 3 months
+2. [20 Essential books that you should read from security world](https://jassics.medium.com/20-essential-books-for-every-security-pros-journey-cfba7033bb1c)
+3. [Application Security Study Plan](https://github.com/jassics/security-study-plan/blob/main/application-security-study-plan.md) (You must go through it before trying for appsec interviews)
+4. You can’t ignore API security at present. So, here is your [API Security Study Plan](https://github.com/jassics/security-study-plan/blob/main/api-security-study-plan.md)
 5. Knowledge of Pentest will be an added advantage for you. Check this out: [Web Pentest Study Plan](https://github.com/jassics/security-study-plan/blob/main/web-pentest-study-plan.md)
-6. You can star or bookmark Security Study Plan which will give you an insight into what to study for various security domains.
+6. You can star or bookmark [Security Study Plan](https://github.com/jassics/security-study-plan) which will give you an insight into what to study for various security domains.
 
 ## This space will focus more on:
 
@@ -50,9 +50,9 @@ Soft skills, team player, presentation skills, communication skills are out of t
 ### Application Security Basics Questions
 1. Explain your top 3 favorite OWASP Top 10 vulnerabilities and why
 2. How does TCP 3-way handshake work?
-3. Why is TLS important in cybersecurity and can you explain the use of TLS in detail for a website?
+3. Why is TLS important in cybersecurity and can you [explain the use of TLS in detail](https://kartik-chauhan.medium.com/demystifying-tls-f049b46eb2b3) for a website?
 4. How SSL/TLS makes my content secured over the internet?
-5. What happens when you type google.com in your browser?
+5. [What happens when you type google.com in your browser?](https://kevinkiruri.medium.com/what-happens-when-you-type-google-com-in-your-browser-and-press-enter-979955e31baf)
 6. What’s the difference between SAST and SCA?
 7. What is SQLi and how would you prevent/mitigate it?
 8. Explain XSS with a few examples and how it can be avoided in the current software world.
@@ -60,7 +60,7 @@ Soft skills, team player, presentation skills, communication skills are out of t
 10. Tell us about a time when you had to learn something new really quickly and how did you go about it?
 
 ### Application Security Role-based questions
-1. Explain CORS, SOP, and CSP from security point of view
+1. [Explain CORS, SOP, and CSP from security point of view](https://medium.com/@zhaojunemail/sop-cors-csrf-and-xss-simply-explained-with-examples-af6119156726)
 2. How is CSRF dangerous for an application and what must be done to prevent CSRF in an application?
 3. Explain the concept of input validation and why it is crucial for secure coding. Provide examples.
 4. How do you approach secure error handling and logging in an application?
@@ -77,7 +77,7 @@ Soft skills, team player, presentation skills, communication skills are out of t
 15. How would you integrate threat modeling into an Agile development process?
 
 ### Overall Application Security Assessment-based Questions
-1. Where do we need security in the SDLC phase?
+1. Where do we need [security in the SDLC phase](https://www.wiz.io/academy/secure-sdlc)?
 2. What would you suggest for input sanitization?
 3. What should a developer do for secrets management?
 4. What are some strategies for ensuring secure session management in web applications?
@@ -86,7 +86,7 @@ Soft skills, team player, presentation skills, communication skills are out of t
 7. How do you ensure that logging and monitoring are implemented securely and do not expose sensitive information?
 8. What are the challenges of implementing SDL in a fast-paced development environment, and how do you overcome them?
 9. Describe the various phases of SDL and the security activities involved in each phase.
-10. How can an attacker exploit SSRF and what an application developer must do to prevent SSRF? This medium article might help you to understand how to bypass SSRF protection.
+10. How can an attacker exploit SSRF and what an application developer must do to prevent SSRF? [This medium article might help you to understand](https://vickieli.medium.com/bypassing-ssrf-protection-e111ae70727b) how to bypass SSRF protection.
 
 ### Some common “test your problem-solving skills” Application Security questions (mostly for senior roles)
 1. What step would you plan to ensure developers follow secure coding practices?
