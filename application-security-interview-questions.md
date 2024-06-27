@@ -32,7 +32,7 @@ __They are:__
 2. 20 Essential books that you should read from security world
 3. Application Security Study Plan (You must go through it before trying for appsec interviews)
 4. You can’t ignore API security at present. So, here is your API Security Study Plan
-5. Knowledge of Pentest will be an added advantage for you. Check this out: Web Pentest Study Plan
+5. Knowledge of Pentest will be an added advantage for you. Check this out: [Web Pentest Study Plan](https://github.com/jassics/security-study-plan/blob/main/web-pentest-study-plan.md)
 6. You can star or bookmark Security Study Plan which will give you an insight into what to study for various security domains.
 
 ## This space will focus more on:
