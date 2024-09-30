@@ -39,6 +39,7 @@ References:
 19. What are the various options/features you have worked in GuardDuty?
 20. I need to get an alert to slack/mail, whenever my backend APIs start giving 5xx in CloudWatch, how would you achieve that?
 21. RTO (Recovery Time Objective) vs RPO (Recovery Point Objective)
+22. [You are trying to SSH into an EC2 instance but it is failing.](https://aws.plainenglish.io/i-have-asked-this-ssh-question-in-every-aws-interview-and-heres-the-catch-ee2013a83e99)
 
 ## IAM
 1. Explain below IAM policy: 
