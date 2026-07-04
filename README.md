@@ -20,3 +20,4 @@ I am adding interview questions based on my experience and different network con
 9. [Container Interview Questions](container-security-interview-questions.md)
 10. [SOC Interview Questions](soc-interview-questions.md)
 11. [GRC Interview Questions](grc-interview-questions.md)
+12. [AI Security Interview Questions](ai-security-interview-questions.md)
