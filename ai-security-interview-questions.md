@@ -42,6 +42,8 @@ References used while compiling this guide: OWASP Top 10 for LLM Applications (2
     24. [Scenario 24: Content-moderation evasion and dialect bias](#scenario-24-your-content-moderation-system-both-lets-real-abuse-through-and-disproportionately-silences-one-communitys-ordinary-speech)
     25. [Scenario 25: First 60 minutes of an active AI data-leak incident](#scenario-25-2-am-page-your-llm-assistant-is-actively-leaking-other-customers-data-in-production-walk-through-the-first-60-minutes)
     26. [Scenario 26: Coordinated disclosure of a prompt-injection PII leak](#scenario-26-an-external-researcher-emails-you-a-working-prompt-injection-exploit-that-exfiltrated-a-real-customers-pii-from-your-production-rag-chatbot-before-youd-even-started-your-incident-response)
+    27. [Scenario 27: Few-shot / in-context-learning example-bank poisoning](#scenario-27-someone-poisons-your-shared-example-bank-and-every-classification-made-using-in-context-learning-silently-shifts-without-anyone-touching-a-training-pipeline-or-the-system-prompt)
+    28. [Scenario 28: Model watermark evasion and false-positive enforcement](#scenario-28-your-text-generation-apis-watermark-gets-stripped-by-a-one-line-paraphrase-attack-and-separately-it-falsely-accuses-a-legitimate-customer-of-tos-violation)
 
 ---
 
@@ -1456,6 +1458,104 @@ def handle_vulnerability_report(report):
 - **Wire the intake process so a confirmed real-data exposure automatically triggers the privacy/legal track**, rather than depending on the individual triager's judgment to remember that an "AI vulnerability" can simultaneously be a "data breach" — this is the single most common gap, since AI vulnerability reports read like a novel technical curiosity right up until someone asks "wait, whose data was that."
 - **Fix root causes, not proof-of-concepts** — the same lesson as every other scenario in this guide (Scenario 1, Scenario 14, Scenario 15): a patch that only blocks the specific reported payload rather than the underlying missing control (account-scoped retrieval, output-side leakage detection) will very likely be bypassed with a minor variation, either by the same researcher on re-test or by someone else later.
 - **Track disclosure-driven findings in the same permanent regression corpus** as internally-found red-team results (Scenario 19) — an externally-reported vulnerability is exactly as valuable a regression test as one your own red team found, and treating it as a one-off email to close out rather than a permanent addition to your test suite wastes the most expensive part of the finding (someone else already did the hard work of discovering it).
+
+---
+
+### Scenario 27: Someone poisons your shared "example bank," and every classification made using in-context learning silently shifts — without anyone touching a training pipeline or the system prompt
+
+**Setup**: Your document-classification assistant doesn't use a static system prompt or a fine-tuned model — it uses **dynamic few-shot prompting**: for each incoming document, it retrieves the 4 most similar previously-labeled examples from a shared "example bank" and includes them in the prompt as in-context demonstrations, so the model classifies the new document by analogy. Internal teams can contribute new labeled examples to the bank to keep it current. Months later, an audit finds that a cluster of contributed examples — all superficially reasonable-looking documents paired with an incorrect label ("policy-violating content" labeled as "compliant") — has been selected as few-shot context thousands of times, and every classification that drew on those examples inherited the wrong behavior, immediately and by design, with the model faithfully following the (poisoned) pattern it was shown.
+
+**What likely happened**: This is **few-shot/in-context-learning poisoning**, worth distinguishing carefully from the training-data poisoning in Scenario 7 and the model-artifact backdoor in Scenario 12: no training or fine-tuning happened here at all — the model's *weights* are completely untouched. The attack instead targets the **in-context examples supplied at inference time**, exploiting the fact that a capable LLM will readily infer and follow the labeling pattern demonstrated by its few-shot examples, even when that pattern is wrong or malicious, because in-context learning has no built-in notion of "these demonstrations might be adversarial." This makes few-shot poisoning distinctly more dangerous in one way and less dangerous in another compared to training-data poisoning: **more dangerous** because it takes effect *immediately* the moment a poisoned example is selected — no retraining cycle, no waiting for the next model release, the very next request that retrieves that example is affected; **less dangerous to remediate** because fixing it is as simple as removing the bad examples from the bank — there's no need to retrain or roll back a model version, since the poison never touched the weights.
+
+**How to confirm/investigate:**
+- Audit the example bank directly for mislabeled or suspiciously-clustered contributions — since nothing here required compromising infrastructure or credentials (if the bank accepts contributions from a broad set of internal users with no review), the "attack" may be as mundane as one person's or team's bad-faith or careless contributions accumulating unnoticed.
+- For any classification decision under dispute, **log and inspect exactly which few-shot examples were retrieved and included** for that specific request — without this, you cannot distinguish "the base model got it wrong" from "it was shown a bad example and followed it faithfully," which completely changes both the fix and who/what is at fault.
+- Check whether the example-selection/retrieval process has any per-example provenance or trust weighting, or whether every example in the bank is treated as equally authoritative regardless of who contributed it or when.
+- Run a **controlled substitution test**: re-classify the same disputed documents using a clean, verified subset of the example bank instead of the retrieved (potentially poisoned) set, and compare — a sharp divergence confirms the few-shot examples, not the base model, are driving the bad outcome.
+
+**Fixes:**
+```python
+# Vulnerable: any contributor can add examples to the shared bank with no review,
+# and retrieval blindly selects "most similar" examples with no provenance/trust check
+def classify(document):
+    examples = example_bank.retrieve_similar(document, k=4)   # trusts the whole bank equally
+    prompt = build_few_shot_prompt(examples, document)
+    return llm.generate(prompt)
+
+# Hardened: contributions are reviewed before entering the trusted pool, retrieval
+# is scoped to a vetted subset, and every classification logs exactly which
+# examples were used so a bad outcome can be traced back to its inputs
+def contribute_example(document, label, contributor):
+    pending_review.add(document, label, contributor)   # never goes live unmoderated
+
+def approve_example(pending_id, reviewer):
+    example = pending_review.get(pending_id)
+    verified_bank.add(example, approved_by=reviewer, added_at=now())   # only vetted examples are retrievable
+
+def classify(document):
+    examples = verified_bank.retrieve_similar(document, k=4)   # retrieval scoped to the vetted pool only
+    prompt = build_few_shot_prompt(examples, document)
+    result = llm.generate(prompt)
+    audit_log.record(document_id=document.id, examples_used=[e.id for e in examples], result=result)  # traceable
+    return result
+```
+- **Treat the example bank as a governed, reviewed artifact, not an open scratch pad** — any pool of demonstrations that directly steers model behavior at inference time needs the same contribution-review discipline as a training dataset (Scenario 7's provenance-weighted training lesson, applied to in-context examples instead of training labels).
+- **Log which specific examples were used for every in-context-learning decision** — this is the single most valuable forensic capability here, since it's what lets you trace a bad classification back to a bad demonstration rather than treating every wrong answer as an inscrutable "the model got it wrong."
+- **Periodically audit the example bank for label-quality drift and adversarial clustering** (similar contributed examples, all skewed toward one incorrect label, especially from a narrow set of contributors) — the same anomaly-detection instinct as auditing a training set, applied continuously since the bank changes over time.
+- **Cap the influence of any single contributor or contribution batch** on which examples actually get selected/trusted, so one compromised account or one bad-faith contributor can't dominate the demonstration pool the way the disputing-accounts fraud ring dominated labels in Scenario 7.
+- **Remediation is fast precisely because no retraining is needed** — once poisoned examples are identified, purging them from the bank immediately restores correct behavior on the next request; make sure your incident response playbook (Scenario 25) recognizes this as a *much* faster fix than a model-weight compromise, so responders don't over-escalate to a full model rollback when removing bad examples is sufficient.
+
+---
+
+### Scenario 28: Your text-generation API's watermark gets stripped by a one-line paraphrase attack — and separately, it falsely accuses a legitimate customer of ToS violation
+
+**Setup**: To combat automated abuse of your text-generation API (mass-produced spam, disinformation campaigns, fake review generation), you deploy an output watermarking scheme — a statistical bias is applied to token selection during generation so that a detector can later determine, with reasonable confidence, whether a piece of text came from your model. Two separate problems surface within the same month: (1) an abuse investigation shows a spam operation running your API's output through a simple off-the-shelf paraphrasing tool before publishing, which reliably strips enough of the statistical signal that your detector reports "not watermarked" on content you know you generated; (2) completely unrelated, a legitimate enterprise customer is auto-flagged and has their account suspended because your detector reported high-confidence watermark presence on a document they wrote mostly themselves but lightly touched up with a couple of API-assisted sentences, and your enforcement policy treats "detected" as equivalent to "this is a ToS violation."
+
+**What likely happened**: These are two distinct failure modes of the *same* control, both important to name separately because they pull mitigation in different directions:
+- **Watermark robustness failure (evasion of the watermark itself)** — watermarking schemes based on biasing token-selection probabilities are known to be fragile against paraphrasing, translation round-trips, or even simple synonym substitution, because those transformations disrupt the exact token sequence the statistical test relies on while preserving the semantic content — this is conceptually the same evasion principle as Scenario 11 and Scenario 24 (perturb the surface form just enough to cross a detector's decision boundary while leaving the underlying content/meaning intact), applied to watermark detection instead of a moderation classifier.
+- **Watermark false positive weaponized into an unreviewed enforcement action** — the deeper design flaw isn't the false positive rate itself (no detector is perfect) but that a **probabilistic signal was wired directly into an automated, consequential action** (account suspension) with no human review or confidence-based escalation, so a legitimate customer with a small amount of true positive signal (they did use the API for part of the document) gets treated identically to a bad-faith, wholesale-generation case.
+
+**How to confirm/investigate:**
+- For the evasion case: reproduce the paraphrase attack yourself against known-generated text and measure the detector's confidence score before and after common transformations (paraphrasing, translation round-trip, minor manual editing) to quantify exactly how much robustness you actually have — "we have a watermark" and "our watermark survives realistic adversarial use" are very different claims, and only the second one is useful for enforcement.
+- For the false-positive case: review the enforcement policy's decision logic — does *any* positive detection trigger suspension regardless of confidence score or the proportion of the document that appears watermarked, or is there a graduated response? A binary policy on a probabilistic signal is itself the root cause, independent of the specific detector's accuracy.
+- Check whether the customer was given any path to contest or provide context before the suspension took effect, or whether the enforcement action was fully automated with no human checkpoint for anything short of a full account ban.
+- Assess reputational/legal exposure from the false accusation specifically — "our AI system automatically and wrongly accused a paying customer of violating policy with no recourse" is a customer-trust and potentially contractual issue distinct from the underlying technical detector accuracy question.
+
+**Fixes:**
+```python
+# Vulnerable: binary "watermark detected -> violation" wired directly into an
+# automated enforcement action, with no confidence tiering or human checkpoint
+def check_content(document):
+    if watermark_detector.is_watermarked(document):   # single boolean, no confidence/coverage info
+        suspend_account(document.author_id)            # irreversible action taken fully automatically
+
+# Hardened: confidence- and coverage-aware detection, tiered response,
+# and human review before any consequential action — the same "gate high-impact
+# actions" principle from Scenario 16 and Scenario 17, applied to enforcement here
+def check_content(document):
+    result = watermark_detector.analyze(document)   # returns confidence score + estimated % of text watermarked
+    if result.confidence < LOW_CONFIDENCE_THRESHOLD:
+        return  # no action — too uncertain to act on at all
+
+    if result.watermarked_fraction < PARTIAL_USE_THRESHOLD:
+        log_for_pattern_monitoring(document, result)  # partial/legitimate assisted use — track trend, don't punish
+        return
+
+    if result.confidence >= HIGH_CONFIDENCE_THRESHOLD and result.watermarked_fraction > BULK_THRESHOLD:
+        flag_for_human_review(document, result)   # even high confidence gets a human checkpoint before suspension
+    else:
+        log_for_pattern_monitoring(document, result)
+
+def enforce_after_human_review(case, reviewer_decision):
+    if reviewer_decision == "confirmed_violation":
+        suspend_account(case.document.author_id, evidence=case.result, reviewed_by=reviewer_decision.reviewer)
+```
+- **Never wire a probabilistic detector directly into an irreversible enforcement action** — the exact same lesson as Scenario 16's refund agent and Scenario 23/24's moderation decisions: confidence-tier the signal, and require human review before anything consequential and hard-to-reverse (account suspension, public accusation) happens on the basis of a statistical detection.
+- **Publish (internally, and to affected users where appropriate) an honest robustness statement for the watermark** — "detectable under normal use, not designed to survive deliberate adversarial paraphrasing" is the accurate claim for most current watermarking schemes; treating watermark detection as forensic-grade proof of provenance when it isn't invites exactly the false-positive enforcement failure here, and overselling its evasion-resistance to stakeholders sets a false expectation that gets exposed the first time an abuser tries even a basic paraphrase.
+- **Combine watermarking with complementary, non-watermark signals** (behavioral/API-usage-pattern anomaly detection, the same techniques from Scenario 8's model-theft investigation, account-level abuse history) rather than relying on the watermark as the sole evidence source — a multi-signal approach is both harder to evade with a single paraphrase and less likely to act on one detector's isolated false positive.
+- **Give a fast, meaningful appeal/contest path** before or immediately upon any enforcement action, the same principle as Scenario 24's content-moderation appeals — a wrongly-suspended legitimate customer needs a way to be heard quickly, not just a ticket into a generic support queue.
+- **Track and report watermark evasion attempts back to the model/detector team as a standing signal**, similar to the jailbreak regression corpus in Scenario 10 — as paraphrasing/evasion tools evolve, your detector's real-world robustness will need to be re-measured periodically rather than assumed to hold indefinitely from a one-time launch evaluation.
+- **Be explicit with legal/trust-and-safety stakeholders that watermarking is a deterrence and detection aid, not a cryptographic guarantee** — set expectations correctly up front so that "the watermark didn't hold up against a determined attacker" is treated as an expected, planned-for limitation rather than an unanticipated failure when it inevitably happens.
 
 ---
 
