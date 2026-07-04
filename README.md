@@ -21,3 +21,4 @@ I am adding interview questions based on my experience and different network con
 10. [SOC Interview Questions](soc-interview-questions.md)
 11. [GRC Interview Questions](grc-interview-questions.md)
 12. [AI Security Interview Questions](ai-security-interview-questions.md)
+13. [Security Architect Scenario-Based Interview Questions](Security_Architect_Scenario_Questions.md)
