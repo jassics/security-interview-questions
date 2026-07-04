@@ -24,6 +24,8 @@
 18. [Scenario 18: Building a Third-Party and Vendor Risk Management Architecture](#scenario-18-building-a-third-party-and-vendor-risk-management-architecture)
 19. [Scenario 19: Leading Security Due Diligence for an Acquisition](#scenario-19-leading-security-due-diligence-for-an-acquisition)
 20. [Scenario 20: Building an Application Security Program From Zero](#scenario-20-building-an-application-security-program-from-zero)
+21. [Scenario 21: Designing an Insider Threat Program and Architecture](#scenario-21-designing-an-insider-threat-program-and-architecture)
+22. [Scenario 22: Designing SaaS Multi-Tenancy Isolation Architecture](#scenario-22-designing-saas-multi-tenancy-isolation-architecture)
 
 ## Scenario 1: Hybrid Cloud Migration
 
@@ -569,3 +571,75 @@ flowchart TD
 - **Don't try to do everything yourself — design for scale from month one**: Even as a single hire, make decisions with the champions-program and paved-road mindset in mind from the start (Scenario 7, Scenario 9) — every guardrail you build should be designed so it can eventually run with light touch from a small team supporting many engineers, rather than architecture that assumes you'll personally review everything forever, because headcount will lag well behind the growth of what needs securing.
 
 - **Report progress against risk reduction, not activity, from the very first update**: Even in month one, frame your update to leadership in terms of "critical vulnerability exposure window shrank from unknown/unmanaged to a defined SLA" rather than "we bought a scanner and ran it" — this sets the right expectation early that the program is accountable for outcomes (tying back to Scenario 13's metrics philosophy), which matters enormously for how much investment and authority you're given in year two.
+
+---
+
+## Scenario 21: Designing an Insider Threat Program and Architecture
+
+**Question**: A departing employee on your engineering team downloaded a large portion of the customer database to a personal USB drive three days before their last day, and nobody noticed until a routine audit weeks later. Leadership asks you to design an insider threat program. How do you approach it technically and organizationally, without turning the company into a surveillance state that destroys engineering trust and productivity?
+
+### Answer:
+
+- **Separate the insider threat *program* (people, process, legal) from the insider threat *architecture* (technical controls) explicitly, and know your lane**: As the security architect, you own the technical detection/prevention architecture; the program itself (when to investigate, HR/legal involvement, thresholds for escalation, employee privacy rights) needs to be jointly owned with HR, Legal, and often a dedicated insider-risk function — building powerful monitoring technology without this governance structure in place risks both legal exposure (privacy law violations) and a program that either overreacts to false positives or under-reacts to real risk with no clear decision authority.
+
+- **Focus technical controls on data movement and privilege, not on generic "employee monitoring"**: The architecture should center on **data exfiltration paths** (USB/removable media controls, egress DLP on email/cloud storage/personal file-sharing, database bulk-export monitoring) and **privileged access anomalies** (a user accessing data far outside their normal role/pattern, unusual volume or timing of access) — broad, generic activity monitoring (keystroke logging, screen recording) is both a much bigger privacy/trust cost and a weaker signal-to-noise technical control than targeted data-movement and access-pattern monitoring.
+
+- **Treat offboarding as a first-class, time-critical security control, since that's exactly where this incident happened**: Access revocation (all systems, not just email/SSO — check for local admin accounts, API keys, and any access provisioned outside central IAM), and **elevated monitoring sensitivity in the weeks before a known departure date** — a departing employee's normal-looking activity in their last two weeks deserves a materially lower anomaly threshold than the same activity from someone with no planned departure, since base-rate risk genuinely differs.
+
+```mermaid
+flowchart TD
+    RESIGN[Resignation/termination\ndate known] --> ELEVATE[Elevated monitoring sensitivity\nfor this identity, time-boxed]
+    ELEVATE --> DLP[DLP: bulk export, USB,\nemail/cloud-storage egress]
+    ELEVATE --> UEBA[UEBA: access pattern\ndeviation from baseline]
+    DLP --> ALERT{Anomaly detected?}
+    UEBA --> ALERT
+    ALERT -- yes --> ESCALATE[Escalate to HR/Legal/\nsecurity jointly, per program policy]
+    LASTDAY[Last day] --> REVOKE[Full access revocation:\nSSO, local accounts, API keys,\nphysical badge, VPN]
+```
+
+- **Invest in User and Entity Behavior Analytics (UEBA) for the access-pattern side, not just rule-based DLP**: Static rules ("alert if >X records exported") are easy to tune around and generate high false-positive rates against legitimate business activity (a data analyst's normal job is bulk queries); behavioral baselining (this specific user's *normal* access volume/pattern, alerting on deviation from their own baseline rather than a fixed global threshold) catches both the sophisticated insider and reduces noise for everyone else.
+
+- **Build in transparency and proportionality to preserve engineering trust, don't monitor silently and universally**: Publish (to all employees, not hidden in a policy nobody reads) what categories of activity are monitored and why, apply monitoring intensity proportional to actual risk/access level (a senior DBA with production database access warrants tighter monitoring than a marketing coordinator) rather than uniformly surveilling everyone at maximum intensity, and route findings through a defined human review and due-process step before any action is taken — a program employees discover only when it's used against someone, with no prior transparency, corrodes trust across the entire engineering org far beyond the individual case.
+
+- **Close the specific gap from the incident with a concrete technical control, not just a policy update**: If USB/removable-media exfiltration wasn't detectable, that's a specific, fixable gap (endpoint DLP with removable-media controls, or blocking removable storage entirely on systems with sensitive data access) — translate the specific incident into a specific closed technical gap, and add "could this specific exfiltration path have been used" as a standing test case for future architecture reviews (tying back to Scenario 6's threat-modeling discipline), rather than only producing a generic "we're now doing insider threat monitoring" response that doesn't actually address the demonstrated gap.
+
+---
+
+## Scenario 22: Designing SaaS Multi-Tenancy Isolation Architecture
+
+**Question**: Your company is building a new B2B SaaS product from scratch. Leadership wants to keep infrastructure costs down by sharing compute and database infrastructure across customers (tenants) rather than provisioning dedicated infrastructure per customer. As the security architect, how do you design tenant isolation so a bug or compromise in one customer's context can never expose another customer's data?
+
+### Answer:
+
+- **Decide the isolation model deliberately, per data sensitivity tier, rather than picking one model for the whole platform**: The three common patterns — **silo** (fully separate infrastructure/database per tenant), **pool** (shared infrastructure/database, isolation enforced entirely in application logic via a tenant ID on every row/query), and **bridge** (a hybrid — shared compute, but separate database/schema per tenant, or separate infrastructure for your highest-tier/most-regulated customers) — trade cost and operational complexity against blast radius directly; the architecturally honest answer is that "pool" (fully shared, logic-enforced) has the lowest cost but the highest blast radius if the isolation logic has even one bug, and the decision about which model to use for which tier of customer/data sensitivity should be made explicitly and documented, not defaulted into purely for engineering convenience.
+
+- **If using the pooled/shared-database model, enforce tenant isolation at the database layer itself, not only in application code**: Application-layer-only isolation (every query manually includes `WHERE tenant_id = ?`) means **one missed `WHERE` clause, in one endpoint, one time, is a full cross-tenant data breach** — use database-native row-level security (RLS, e.g., PostgreSQL RLS policies) so that even a query that forgets the tenant filter is still constrained by the database itself based on the authenticated connection's tenant context, making the isolation guarantee independent of every single developer getting every single query right, forever.
+
+```sql
+-- PostgreSQL Row-Level Security: isolation enforced by the database itself,
+-- not solely trusted to every application query remembering a WHERE clause
+ALTER TABLE customer_data ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation_policy ON customer_data
+    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+-- Every query against this table is now automatically filtered to the
+-- session's current tenant, even if the application code forgets the WHERE clause
+```
+
+- **Propagate tenant context through a single, trusted, request-scoped mechanism — never trust a tenant ID passed as a client-supplied parameter**: The tenant ID for a request should be derived from the authenticated session/token (resolved server-side from the user's identity, e.g., embedded as a verified claim in their JWT) and set into the database session context at the start of request handling — if any code path accepts a `tenant_id` directly from a request parameter/body and uses it to scope a query, that's a direct cross-tenant BOLA-equivalent vulnerability (an authenticated user from Tenant A simply passes Tenant B's ID and reads Tenant B's data).
+
+```mermaid
+flowchart LR
+    REQ[Incoming request] --> AUTH[Authenticate:\nresolve tenant_id from\nverified JWT claim, NEVER\nfrom a request parameter]
+    AUTH --> SETCTX[Set tenant_id in\nDB session context]
+    SETCTX --> QUERY[Application queries run\nnormally; RLS enforces\ntenant scoping regardless]
+    QUERY --> RESP[Response — structurally\ncannot include another\ntenant's rows]
+```
+
+- **Isolate compute-level resources for shared-infrastructure risks, not just data**: Beyond the database, consider tenant isolation for caching layers (a shared Redis cache keyed without tenant scoping can leak cached data cross-tenant), background job queues (a job processing another tenant's data shouldn't be schedulable/inspectable by a different tenant's context), and any file storage (object storage keys/paths must be tenant-scoped and access-controlled, not just conventionally namespaced) — cross-tenant leakage bugs show up in exactly these "secondary" shared components as often as in the primary database, precisely because they get less security attention than the main data store.
+
+- **Isolate noisy-neighbor and resource-exhaustion risk, not just data-confidentiality risk**: In a pooled model, one tenant's expensive/abusive usage (a runaway report generation job, a burst of API traffic) can degrade performance for every other tenant sharing the same infrastructure — apply per-tenant resource quotas and rate limiting (tying back to the API rate-limiting discipline in the [API Security file](api-security-interview-questions.md#fundamentals)) so isolation covers availability, not only confidentiality.
+
+- **Test tenant isolation as a dedicated, standing security control, not an assumed property of "we wrote the code carefully"**: Build automated tests that specifically attempt cross-tenant access (authenticated as Tenant A, attempt to read/write Tenant B's known resources across every endpoint) and run them on every deployment, and include tenant-isolation-bypass attempts as an explicit, mandatory category in any penetration test scope for the platform — this is exactly the kind of property that "looks correct" in code review for every individual endpoint while still having exactly one gap somewhere that a systematic, automated cross-tenant test suite will catch and a code reviewer reading one file at a time will not.
+
+- **Plan for tenant-tier upgrades/downgrades in the isolation architecture from the start**: When a customer on the shared/pooled tier needs to move to a dedicated/siloed tier (common as enterprise customers demand stronger guarantees, often contractually), the migration path (data migration, cutover, decommissioning the pooled-tier copy of their data) needs to be a designed, tested process — discovering this need only when your first enterprise customer's contract requires it, with no existing migration tooling, turns a sales-cycle requirement into a security-architecture fire drill.
