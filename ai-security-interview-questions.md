@@ -467,4 +467,77 @@ flowchart LR
 
 ---
 
+### Scenario 7: Your fraud-detection model's accuracy quietly degrades after you started accepting user-submitted "report as legitimate" feedback to retrain it
+
+**Setup**: To reduce false positives, the fraud team lets users dispute a fraud flag ("this was actually me"). Disputed transactions get relabeled and fed into the next weekly retraining job. Over a few months, a fraud ring systematically disputes flags on their own confirmed-fraudulent transactions, and the retrained model becomes measurably worse at catching their pattern.
+
+**What likely went wrong**: This is **data poisoning via a feedback loop** (OWASP LLM04 / classic ML poisoning) — the retraining pipeline treats user-submitted labels as ground truth with no independent verification, and the attacker controls a chunk of that "ground truth." Because the poisoning is gradual and distributed across many accounts/transactions, it looks like normal label noise rather than an attack, which is why it took months to notice.
+
+**How to confirm/investigate:**
+- Diff model performance metrics (precision/recall on a **held-out, never-retrained** golden test set) release over release — a golden set is what catches this; if you only ever evaluate on the latest retrain's data, you can't detect drift the attacker is causing.
+- Look at the provenance of disputed labels: cluster disputing accounts by shared attributes (device fingerprint, IP range, creation date, transaction graph proximity) — coordinated disputing accounts are a strong poisoning signal.
+- Check whether any single account/cluster contributes a disproportionate share of the label flips used in a given retraining cycle.
+
+**Fixes:**
+```python
+# Vulnerable: user-submitted disputes flow straight into the training label
+def apply_dispute(transaction_id, user_claim):
+    db.update_label(transaction_id, label="legitimate" if user_claim else "fraud")
+    # next retrain job pulls straight from this table with no independent check
+
+# Hardened: disputes become a *signal for human/secondary review*, not a direct label change,
+# and no single source can move the needle on the training set unchecked.
+def apply_dispute(transaction_id, user_claim, account_id):
+    dispute_queue.add(transaction_id, user_claim, account_id)
+    if dispute_rate_for(account_id) > SUSPICIOUS_THRESHOLD:
+        flag_for_fraud_review(account_id)          # coordinated disputing is itself a fraud signal
+    # label only changes after independent verification (secondary model + human reviewer),
+    # never directly from the disputing party's own claim
+```
+- **Provenance-weighted training** — down-weight or exclude labels sourced from low-trust/unverified channels; require independent corroboration (e.g., chargeback outcome, secondary model agreement) before a disputed label flips.
+- **Rate/impact limits on label influence** — cap how much any single account or correlated cluster of accounts can shift the training distribution in one cycle.
+- **Held-out golden eval set** that is never touched by the retraining pipeline, checked on every release — this is your canary for silent poisoning.
+- **Human review + anomaly detection on the training set itself** before each retrain (statistical outlier/cluster analysis on newly added labels), not just on the model's output.
+
+---
+
+### Scenario 8: A competitor launches a model that behaves suspiciously similar to yours a few months after opening your model API to paying customers
+
+**Setup**: You expose a proprietary classification/generation model via a metered API. Usage logs show one API key made an unusually large volume of diverse, systematically-varied queries over several weeks (far more than any real customer workload), shortly before a competitor released a model with near-identical behavior on your benchmark set.
+
+**What likely happened**: This is **model extraction/theft** — the attacker used your API as an oracle, submitting a broad, systematically constructed sweep of inputs and using the input/output pairs to train a "student" model that mimics yours (distillation-style extraction), or to directly reconstruct decision boundaries closely enough to compete.
+
+**How to confirm/investigate:**
+- Pull query logs for the suspicious key(s): look for **near-uniform coverage of input space**, sequential/programmatic-looking query patterns, high diversity with low semantic relation to any real use case, and volume far exceeding stated business use.
+- Check whether the account requested **maximum-verbosity outputs** where available (full logit/probability vectors, top-k alternatives, embeddings) rather than just the top prediction — richer outputs make extraction dramatically cheaper, so an extractor will ask for everything available.
+- Compare timing: extraction campaigns are often front-loaded (burst of queries) then go quiet once enough data is collected.
+
+**Mitigations going forward:**
+```python
+# Vulnerable: unrestricted access to full model internals via the API
+def predict(request):
+    return {
+        "logits": model.raw_logits(request.input),   # full probability vector - cheap to distill from
+        "embedding": model.embed(request.input),
+    }
+
+# Hardened: minimum necessary output, rate-limited, anomaly-monitored
+def predict(request):
+    check_rate_limit(request.api_key)                 # per-key + per-account quotas
+    result = model.predict(request.input)
+    log_for_anomaly_detection(request.api_key, request.input, result)
+    return {
+        "label": result.top_label,                     # no raw logits/full distribution by default
+        "confidence_bucket": bucket(result.confidence), # coarse confidence, not precise float
+    }
+```
+- **Rate limiting and cost/quota caps per key/account**, tuned below the query volume a realistic extraction attack needs.
+- **Restrict output richness by default** — only return full logits/embeddings/explanations to explicitly trusted, contractually-bound partners, not the general API tier.
+- **Query pattern anomaly detection** — flag systematic space-filling queries, high-diversity low-relevance traffic, or sudden bursts inconsistent with the account's historical usage.
+- **Watermarking** model outputs where the modality supports it, so a suspected clone can later be forensically linked back to extraction from your API.
+- **Legal/contractual controls** (ToS prohibiting bulk/automated querying for training purposes) as a backstop — not a technical control, but it matters for enforcement once you have the anomaly evidence.
+- **Tiered access** — reserve full-fidelity output and higher rate limits for identity-verified enterprise customers with contractual restrictions, keep self-serve/free tiers on coarse output and tight quotas.
+
+---
+
 *Contributions welcome — add real interview questions/scenarios you've encountered via PR.*
