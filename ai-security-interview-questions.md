@@ -665,4 +665,56 @@ def handle_chat(session_id, user_message):
 
 ---
 
+### Scenario 11: Your image-based content-moderation classifier stops flagging a category of policy-violating images that a human reviewer catches instantly
+
+**Setup**: You run a CNN-based classifier that auto-flags policy-violating images (e.g., graphic content) before they're posted. Human moderators start noticing a pattern: certain flagged-by-humans images are consistently scored as "safe" by the model, even though nothing about them looks unusual to a person. Someone eventually notices the offending images all carry a barely visible, faint noise-like texture overlay.
+
+**What likely happened**: This is a classic **evasion attack using adversarial examples** — the attacker adds a carefully crafted, human-imperceptible perturbation to the image (often generated via gradient-based methods like FGSM/PGD against a surrogate model, or through black-box query-based optimization if they only have API access) that pushes the input just across the model's decision boundary from "violating" to "safe," without changing what a human perceives. Unlike prompt injection (which manipulates an LLM via natural-language instructions), evasion attacks manipulate the **input's raw features** to fool a model's learned decision boundary directly — this applies to any classifier (image, audio, malware/URL scanners, fraud-transaction scoring), not just LLMs.
+
+**How to confirm/investigate:**
+- Diff the flagged-safe images against known-violating images pixel-wise; a perturbation invisible to the eye but present in the pixel data (unusual high-frequency noise, structured patterns concentrated where they'd most affect the model's learned features) is the signature.
+- Run the same images through a **different model architecture** (a second, independently trained classifier) — adversarial perturbations crafted against one model often transfer poorly to a structurally different one, so a mismatch between "model A says safe, model B says violating, human says violating" is a strong evasion signal.
+- Check whether the attacker had **API access to confidence scores/logits** — query-based black-box evasion attacks (e.g., boundary attacks) are far easier when the attacker can iteratively probe the model's confidence and adjust the perturbation, which loops back to the "restrict output richness" lesson from the model-theft scenario.
+
+**Fixes:**
+```python
+# Vulnerable: single model, full trust, no adversarial-robustness testing before deployment
+def moderate_image(image):
+    score = classifier.predict(image)
+    return score < VIOLATION_THRESHOLD   # attacker only needs to find inputs that clear this one bar
+
+# Hardened: ensemble of diverse models + input preprocessing that disrupts fragile perturbations,
+# plus treating "high-confidence safe on a borderline-looking image" as itself suspicious
+def moderate_image(image):
+    preprocessed = randomized_smoothing(image)          # small random transforms disrupt brittle,
+                                                          # precisely-tuned adversarial perturbations
+    scores = [m.predict(preprocessed) for m in ENSEMBLE_MODELS]   # independently trained/architected models
+    if disagreement(scores) > DISAGREEMENT_THRESHOLD:
+        return route_to_human_review(image)              # models disagreeing sharply is itself a signal
+    return aggregate(scores) < VIOLATION_THRESHOLD
+```
+- **Ensemble diverse model architectures** rather than relying on one classifier — an adversarial perturbation crafted against one model is far less likely to simultaneously fool several independently trained/architected models.
+- **Input preprocessing/randomization** (randomized smoothing, JPEG re-compression, resizing) before scoring — many gradient-based perturbations are fragile and lose effectiveness under small, non-adversarial transformations that don't affect human perception.
+- **Adversarial training** — include adversarial examples generated against your own model in the training set so it learns to be robust to that perturbation class (an ongoing arms race, not a one-time fix).
+- **Restrict output granularity on any exposed scoring API** (confidence scores/logits), same principle as defending against model extraction — the richer the feedback an attacker gets, the cheaper it is to optimize an evasive perturbation against you.
+- **Human-in-the-loop for low-margin/borderline decisions** — route cases where model confidence sits near the decision threshold, or where an ensemble disagrees, to a human reviewer instead of auto-approving.
+- **Treat this as a continuous red-team surface**: periodically run known evasion-attack toolkits (e.g., the adversarial-robustness techniques used by tools like Foolbox/CleverHans, referenced in the [Senior AI Pentester scenarios](Senior%20AI%20Pentester_Interview.md)) against your own production model as part of routine red-teaming, not just at initial launch.
+
+```mermaid
+flowchart TD
+    IMG[Incoming image] --> PRE[Randomized preprocessing\n(resize / recompress / smoothing)]
+    PRE --> M1[Model A]
+    PRE --> M2[Model B\n(different architecture)]
+    PRE --> M3[Model C]
+    M1 --> AGG{Ensemble agreement?}
+    M2 --> AGG
+    M3 --> AGG
+    AGG -- high confidence, agree --> AUTO[Automated decision]
+    AGG -- disagreement or\nnear threshold --> HUMAN[Route to human reviewer]
+```
+
+**Follow-up an interviewer may ask — "how is this different from a jailbreak?"**: A jailbreak manipulates an LLM through *language* to get it to violate its own instructed behavior; an evasion attack manipulates the *raw input features* of any ML model (image, audio, tabular, or text embeddings) to cross a learned decision boundary, with no need for natural-language instructions at all. Both are inference-time attacks, but jailbreaks exploit the model's instruction-following/alignment layer, while evasion attacks exploit the model's underlying statistical decision function directly — which is why a purely prompt-based guardrail does nothing to stop evasion against a non-language classifier.
+
+---
+
 *Contributions welcome — add real interview questions/scenarios you've encountered via PR.*
