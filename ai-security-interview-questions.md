@@ -1352,4 +1352,85 @@ def evaluate_moderation_model(model):
 
 ---
 
+### Scenario 25: 2 a.m. page — your LLM assistant is actively leaking other customers' data in production. Walk through the first 60 minutes.
+
+**Setup**: An on-call alert fires from the canary-token/output-anomaly detection you built after earlier incidents (see Scenario 14): your multi-tenant support chatbot is returning fragments of a different customer's conversation history in response to normal queries. The root cause isn't confirmed yet — it could be a caching bug, a RAG retrieval-filter regression, or an active attacker who found a new prompt-injection technique. You are the first responder.
+
+**Why AI incidents need an adapted IR playbook, not just the standard one**: A conventional security incident usually has a clear "patch the vulnerability" containment step. An AI incident often doesn't — you frequently can't instantly "fix" a model's behavior; you can only change what surrounds it (guardrails, retrieval filters, feature flags) or take the capability offline entirely. The IR sequence below adapts the standard identify → contain → eradicate → recover → learn lifecycle to that reality, which is exactly the kind of adaptation the **NIST AI RMF's "Manage" function** calls out — AI risk response needs playbooks that account for the ways AI systems fail and get fixed differently from conventional software.
+
+**First 60 minutes — a concrete walkthrough:**
+1. **Contain fast, even before root cause is known (0–10 min).** Because you can't "hotfix" a model's behavior live, your fastest containment lever is almost always a **feature flag / kill switch that disables the leaking capability** (in this case, RAG retrieval or the whole chatbot) rather than trying to patch behavior in place — the same kill-switch principle from Scenario 13's plugin incident, generalized to any AI capability. Flip it now; you can re-enable narrower functionality once you understand scope.
+2. **Freeze evidence before it rotates out of logs (10–15 min).** Pull and preserve full prompt/response logs (system + retrieved context + user input + output) for the affected time window immediately — many logging pipelines have short retention or get overwritten, and this is the evidence that will let you distinguish "caching bug" from "prompt injection" from "access-control regression," which drives everything downstream (this ties back to the "log full prompts for audit" guidance in Q11).
+3. **Scope the blast radius (15–30 min).** Query the preserved logs for every instance where cross-tenant content appears in an output — how many customers affected, over what time window, what categories of data (this determines whether this is a contained bug or a reportable breach; see the disclosure scenario below).
+4. **Identify root cause in parallel with scoping (15–40 min).** Check, in order of likelihood given the symptom: did the RAG retrieval filter change recently (Scenario 1's exact failure mode)? Is there a caching layer keying on the wrong identity? Are the anomalous outputs correlated with any specific input pattern suggesting active prompt injection rather than a passive bug? Don't assume malicious activity by default — but don't rule it out either, since the response obligations differ (a bug fix vs. an active attacker changes whether you also need active threat containment, not just a code fix).
+5. **Communicate internally on a fixed cadence (throughout).** Loop in legal/privacy immediately once cross-tenant *personal* data exposure is confirmed, even before root cause is nailed down — breach-notification clocks in many jurisdictions start from confirmed exposure, not from root-cause completion, so legal needs lead time in parallel with the technical investigation, not after it.
+
+**Fixes / the standing capability this incident should leave behind:**
+```python
+# The capability that makes step 1 possible — every AI feature needs an
+# instant, independent kill switch, checked before request processing even begins
+FEATURE_FLAGS = {"rag_chatbot_enabled": True}
+
+def handle_chat_request(request):
+    if not FEATURE_FLAGS["rag_chatbot_enabled"]:
+        return SERVICE_UNAVAILABLE_RESPONSE          # one flag flip takes the whole capability offline instantly
+    return process_chat(request)
+
+# The capability that makes step 2/3 possible — durable, queryable, tamper-evident
+# logging of the full prompt/response context, not just the final chat message
+def log_interaction(session_id, system_prompt, retrieved_context, user_input, output):
+    incident_log.write({
+        "session_id": session_id, "account_id": current_account_id(),
+        "system_prompt_hash": hash(system_prompt), "retrieved_doc_ids": [d.id for d in retrieved_context],
+        "user_input": user_input, "output": output, "timestamp": now(),
+    })   # retained long enough, and queryable enough, to reconstruct exactly what happened during an incident
+```
+- **Build the kill switch and the forensic-grade logging *before* you need them** — an AI incident response plan that assumes you'll be able to add these under pressure at 2 a.m. is not a plan; both need to exist in production ahead of time (this is a direct, practical output of the red-team/governance work in Scenarios 19–20, not a separate afterthought).
+- **Write an AI-specific incident response runbook in advance** covering the AI-specific containment options (kill switches, guardrail tightening, model/prompt rollback, rate-limit clamping) as first-class response actions alongside conventional ones (credential rotation, network isolation), so the on-call responder isn't inventing containment strategy from scratch during the incident.
+- **Practice this runbook via tabletop exercises**, the same discipline as conventional security IR tabletops, specifically using AI-incident scenarios (injection-driven data leak, jailbreak producing harmful content publicly, agent taking an unauthorized high-impact action) — the failure modes are different enough from conventional incidents that generic IR training doesn't fully transfer.
+- **Post-incident, feed the finding back into the standing regression/eval suites** referenced throughout this guide (Scenario 1's retrieval-filter test, Scenario 10's jailbreak corpus, Scenario 19's red-team suite) — an AI incident that doesn't produce a permanent regression test is very likely to recur in a slightly different form.
+
+---
+
+### Scenario 26: An external researcher emails you a working prompt-injection exploit that exfiltrated a real customer's PII from your production RAG chatbot — before you'd even started your incident response
+
+**Setup**: A security researcher, following responsible disclosure norms, emails your published security contact with a detailed writeup: a crafted indirect-injection payload planted in a public review that your RAG chatbot ingests, which causes the chatbot to leak a different real customer's order history when asked an unrelated question. They've included a proof-of-concept, timestamps, and a note that they'll wait 90 days before any public writeup, per standard coordinated-disclosure practice. Now you have simultaneously: an active vulnerability to fix, a real customer PII exposure to assess and possibly report, and an external party whose expectations and timeline you need to manage.
+
+**What this scenario is really testing**: Unlike Scenario 25 (an internally-detected incident already in progress), this tests how you run **coordinated vulnerability disclosure specifically for an AI/LLM vulnerability**, and — critically — how you correctly recognize that a security vulnerability report and a **privacy/data-breach event** are two overlapping but distinct obligations that both need to be triggered here, not just one. Many teams handle the security-disclosure half well (they've done it for web vulnerabilities before) but miss that "an LLM was manipulated into disclosing another customer's PII" is *also* a data breach in the classical, regulatory sense, triggering separate legal notification timelines regardless of how novel or "AI-specific" the vulnerability mechanism was.
+
+**How to run this well, step by step:**
+1. **Acknowledge quickly and set expectations (within 24–48 hours).** Confirm receipt, thank the researcher, and give a realistic timeline — this is standard practice for any vulnerability report, but it matters especially here because a frustrated researcher who feels ignored is more likely to disclose early, and you genuinely need the goodwill of the 90-day window to do this properly.
+2. **Reproduce and confirm independently (immediately, in parallel with acknowledgment).** Validate the researcher's PoC in a controlled environment; don't take the report at face value without confirming it yourself, but also don't let "we're still verifying" become an excuse to delay containment once it's clearly reproducible — the containment playbook from Scenario 25 (kill switch, evidence preservation, blast-radius scoping) starts the moment you've confirmed it's real, not after the full fix is designed.
+3. **Trigger the privacy/legal track immediately, in parallel with the security fix track, not after it.** The moment real customer PII exposure is confirmed, this becomes a data-privacy incident subject to breach-notification law (GDPR, state breach-notification statutes, sector-specific rules depending on the data involved) — this is the exact same trigger point discussed in Scenario 25's step 5, and it's easy to under-prioritize because the *mechanism* (a novel prompt-injection technique) feels like a pure security curiosity rather than "a breach," even though the *effect* (unauthorized disclosure of another person's PII) is what actually matters for the legal obligation.
+4. **Fix the underlying vulnerability at the right layer**, not just the specific PoC — per Scenario 1's lesson, the real fix here is enforcing account-scoped retrieval filtering at the vector-query layer, not merely blocking the specific injection phrasing the researcher used (a phrasing-specific patch invites a trivial bypass and a second, more frustrated disclosure).
+5. **Coordinate the public disclosure timeline honestly.** Agree on a disclosure date with the researcher, aim to have the fix verified well before it, and if you need more time, ask for an extension transparently rather than going silent — silence is what turns a cooperative researcher into an early, uncoordinated public disclosure.
+6. **Credit the researcher and consider a bounty**, if you run or can stand up a disclosure/bounty program — treating external AI-vulnerability research as adversarial rather than as a gift (this researcher found and responsibly reported a real customer-data exposure before it was exploited maliciously) actively discourages the exact behavior that benefits you most.
+7. **Run the post-incident retrospective covering both tracks**: did the security fix get a permanent regression test (per Scenario 25's closing lesson), and did the privacy/legal review conclude notification was or wasn't required, documented with the reasoning — both outcomes need a paper trail regardless of which way the legal determination went.
+
+**The structural fix that should exist before the *next* report arrives:**
+```python
+# A disclosure intake process that automatically triggers BOTH tracks in parallel,
+# rather than relying on whoever reads the email first to remember to loop in privacy/legal
+def handle_vulnerability_report(report):
+    ticket = security_intake.create(report, sla_hours=48)
+    reproduced = attempt_reproduction(report, environment="isolated_staging")
+
+    if reproduced and reproduced.involves_real_user_data:
+        privacy_incident = privacy_intake.create(
+            source="external_disclosure",
+            data_categories=reproduced.exposed_data_categories,
+            affected_user_count=reproduced.estimate_scope(),
+        )   # fires the breach-assessment/legal clock in parallel with the security fix, not after it
+        notify(legal_team, privacy_incident)
+
+    notify(security_lead, ticket)
+    return DisclosureCase(ticket=ticket, privacy_incident=locals().get("privacy_incident"), researcher=report.contact)
+```
+- **Have a published, easy-to-find security contact/disclosure policy** specifically covering AI/model vulnerabilities (prompt injection, jailbreaks, data leakage via the model) — don't make researchers guess whether your standard bug-bounty scope even covers "I manipulated your chatbot into leaking data," since ambiguity here is exactly what pushes reports to public disclosure instead of responsible channels.
+- **Wire the intake process so a confirmed real-data exposure automatically triggers the privacy/legal track**, rather than depending on the individual triager's judgment to remember that an "AI vulnerability" can simultaneously be a "data breach" — this is the single most common gap, since AI vulnerability reports read like a novel technical curiosity right up until someone asks "wait, whose data was that."
+- **Fix root causes, not proof-of-concepts** — the same lesson as every other scenario in this guide (Scenario 1, Scenario 14, Scenario 15): a patch that only blocks the specific reported payload rather than the underlying missing control (account-scoped retrieval, output-side leakage detection) will very likely be bypassed with a minor variation, either by the same researcher on re-test or by someone else later.
+- **Track disclosure-driven findings in the same permanent regression corpus** as internally-found red-team results (Scenario 19) — an externally-reported vulnerability is exactly as valuable a regression test as one your own red team found, and treating it as a one-off email to close out rather than a permanent addition to your test suite wastes the most expensive part of the finding (someone else already did the hard work of discovering it).
+
+---
+
 *Contributions welcome — add real interview questions/scenarios you've encountered via PR.*
