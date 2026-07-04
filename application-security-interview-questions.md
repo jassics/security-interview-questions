@@ -1,5 +1,13 @@
 # Application Security Interview Questions
 
+## Scope note — how this fits with the other files in this repo
+This repo splits the broad "AppSec" space into three focused files so each can go deep without repeating the others:
+- **This file (Application Security)** owns the SDLC-centric, developer-facing side of the role — secure code review, secure coding practices, threat modeling, SDL/SSDLC process, cryptography basics, and the "how do you get engineering to build secure software" leadership/process questions. This is the defensive, developer-centric track, as distinct from offensive/pentest work.
+- **[API Security](api-security-interview-questions.md)** owns everything specific to API surfaces in depth — the OWASP API Security Top 10 (BOLA, mass assignment, broken function-level authorization, GraphQL-specific risks), JWT/OAuth2/mTLS deep dives, and API gateway architecture. Where a question below touches API security only briefly, it links out to that file rather than duplicating the full mechanics.
+- **[Web Security](web-security-interview-questions.md)** owns the offensive/exploit-mechanics and pentest-methodology side — how XSS/CSRF/SSRF/clickjacking/open-redirect/CORS-misconfiguration actually work under the hood, browser security model fundamentals (SOP/CORS/CSP/cookies), and web application penetration-testing methodology. Where a question below references one of these by name, see that file for the full exploit walkthrough and code-level fix rather than re-deriving it here.
+
+The short version: if a question here is about *process, review, or design* ("how do you run a secure code review," "how do you threat model a payments feature"), it stays in this file. If it's about *how a specific exploit works or how to test for it*, follow the link to Web Security or API Security for the deep dive.
+
 ## Setting up the context
 You can assess yourself by checking how many of these application security interview questions are easy for you, how many need finetuning and how many are yet to learn and master. Remember, every one of us is learning and a question is easy for you doesn’t mean it’s the same for everyone. However, it depends upon the role, and expectations set by the hiring manager and the interviewer.
 
@@ -41,7 +49,7 @@ __They are:__
 2. Threat Modeling
 3. Secure Coding
 4. Secure Development
-5. And anything that is defensive in nature and developer centric. For everything else related to [web security we have another page](web-security-interview-questions.md).
+5. And anything that is defensive in nature and developer centric. For everything related to browser/network-facing exploit mechanics and pentest methodology, see [Web Security](web-security-interview-questions.md); for anything specific to securing API surfaces, see [API Security](api-security-interview-questions.md) (see the Scope note above for the full split).
 
 If you are interviewing someone for Application Security Engineer role, could be juinor, senior or architect level.
 You can always start questions based on the person's experience in AppSec. However, below questions can be always interesting and will help you to understand the candidate better technically.
@@ -55,13 +63,13 @@ Soft skills, team player, presentation skills, communication skills are out of t
 5. [What happens when you type google.com in your browser?](https://kevinkiruri.medium.com/what-happens-when-you-type-google-com-in-your-browser-and-press-enter-979955e31baf)
 6. What’s the difference between SAST and SCA?
 7. What is SQLi and how would you prevent/mitigate it?
-8. Explain XSS with a few examples and how it can be avoided in the current software world.
+8. Explain XSS with a few examples and how it can be avoided in the current software world. (→ For the three XSS types and full exploit mechanics, see [Web Security Q5](web-security-interview-questions.md#owasp-top-10-2021--exploit-mechanics) and [Scenario 1](web-security-interview-questions.md#scenario-1-stored-xss-in-a-comment-field-bypasses-a-client-side-filter); here, focus the answer on *secure development* practice — output encoding by default, auto-escaping template engines, CSP as defense-in-depth.)
 9. How to avoid brute-force attacks on an application. Let’s say the login page. Explain everything that comes to your mind.
 10. Tell us about a time when you had to learn something new really quickly and how did you go about it?
 
 ### Application Security Role-based questions
-1. [Explain CORS, SOP, and CSP from security point of view](https://medium.com/@zhaojunemail/sop-cors-csrf-and-xss-simply-explained-with-examples-af6119156726)
-2. How is CSRF dangerous for an application and what must be done to prevent CSRF in an application?
+1. [Explain CORS, SOP, and CSP from security point of view](https://medium.com/@zhaojunemail/sop-cors-csrf-and-xss-simply-explained-with-examples-af6119156726) (→ Full browser-security-model mechanics and the common CORS misconfiguration pattern: [Web Security Q1-3](web-security-interview-questions.md#browser-security-model-fundamentals))
+2. How is CSRF dangerous for an application and what must be done to prevent CSRF in an application? (→ Full CSRF mechanics, why `SameSite` alone doesn't fully retire it, and a "token present but never validated" scenario: [Web Security Q6](web-security-interview-questions.md#owasp-top-10-2021--exploit-mechanics) and [Scenario 2](web-security-interview-questions.md#scenario-2-csrf-token-present-but-the-state-changing-action-still-succeeds))
 3. Explain the concept of input validation and why it is crucial for secure coding. Provide examples.
 4. How do you approach secure error handling and logging in an application?
 5. Discuss the role of encryption in secure coding and some best practices for implementing it.
@@ -86,7 +94,7 @@ Soft skills, team player, presentation skills, communication skills are out of t
 7. How do you ensure that logging and monitoring are implemented securely and do not expose sensitive information?
 8. What are the challenges of implementing SDL in a fast-paced development environment, and how do you overcome them?
 9. Describe the various phases of SDL and the security activities involved in each phase.
-10. How can an attacker exploit SSRF and what an application developer must do to prevent SSRF? [This medium article might help you to understand](https://vickieli.medium.com/bypassing-ssrf-protection-e111ae70727b) how to bypass SSRF protection.
+10. How can an attacker exploit SSRF and what an application developer must do to prevent SSRF? [This medium article might help you to understand](https://vickieli.medium.com/bypassing-ssrf-protection-e111ae70727b) how to bypass SSRF protection. (→ Full SSRF walkthrough with code — resolved-IP validation, redirect handling, cloud metadata endpoint protection: [API Security Scenario 6](api-security-interview-questions.md#scenario-6-ssrf-via-a-fetch-this-url-webhookimport-feature))
 
 ### Some common “test your problem-solving skills” Application Security questions (mostly for senior roles)
 1. What step would you plan to ensure developers follow secure coding practices?
@@ -123,7 +131,7 @@ Insecure code snippets can be on a tougher note. However, I am adding a few easy
 
 I would give you a hint for your practice, but in an interview, you won’t be given any hint.
 
-1. Identify the security issue in this code snippet and explain how you would fix it. [Hint: Can you spot the CSRF issue here?]
+1. Identify the security issue in this code snippet and explain how you would fix it. [Hint: Can you spot the CSRF issue here?] (→ [Web Security Scenario 2](web-security-interview-questions.md#scenario-2-csrf-token-present-but-the-state-changing-action-still-succeeds) walks through the closely-related "token present but never validated" variant of this exact bug class with a fixed code sample.)
 ```php
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $userId = $_POST['userId'];
@@ -132,7 +140,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 }
 ```
 
-2. Identify the security issue in this code snippet and explain how you would fix it. [Hint: Insecure desrialization]
+2. Identify the security issue in this code snippet and explain how you would fix it. [Hint: Insecure desrialization] (→ [Web Security Q9](web-security-interview-questions.md#owasp-top-10-2021--exploit-mechanics) explains why this class of bug routinely escalates to RCE via gadget chains, not just a data-integrity issue.)
 
 ```java
 ObjectInputStream in = new ObjectInputStream(new FileInputStream("data.ser"));
@@ -271,9 +279,13 @@ Are they able to explain common methods and protocols for both AuthN and AuthZ?
 Go as much deep as you can.
 Use this article to [understand details of CSP](https://hackernoon.com/everything-you-need-to-know-about-content-security-policy-csp-qt2g37wv)
 
+A strong answer should also flag the most common way teams accidentally neutralize their own CSP — see [Web Security Q3](web-security-interview-questions.md#browser-security-model-fundamentals) on the `'unsafe-inline'` trap.
+
 ### 14. Benefits of using SoP, CORS and CSP? 
 Explain the basics of these concepts with one or two real world examples.
 Also, explain why to use these and where with few scenarios.
+
+(→ [Web Security Q1-3](web-security-interview-questions.md#browser-security-model-fundamentals) has the full mechanics for all three, including the specific CORS misconfiguration pattern — reflected `Origin` + `Allow-Credentials: true` — that shows up constantly in real security reviews.)
 
 ### 15. How do you handle typical developer and security clash situation?
 
@@ -303,12 +315,13 @@ See if the interviewee is able to explain below points:
 ### 19. What would do you suggest for input sanitization?
 
 ### 20. What have you done so far for API Security?
-You can't think of application security without API security at present. However, I will cover more on [API security Interview Questions](/api-security-interview-questions.md) in another page.
+You can't think of application security without API security at present. The full OWASP API Security Top 10, JWT/OAuth2/mTLS deep dives, GraphQL-specific risks, and API gateway architecture are covered in depth in [API Security Interview Questions](api-security-interview-questions.md).
 
 ### 21. Why XoR is very important in Crypto world?
 It's basic of Cryptography but untouched topic and I would recommend every AppSec engineer to go through basics of Cryptography.
 
 ### 22. How OAuth works?
+(→ For the API-specific deep dive — comparing API keys, OAuth2 bearer tokens, and mTLS, plus a full JWT security-review checklist — see [API Security Q11-12](api-security-interview-questions.md#authentication--authorization-deep-dive).)
 
 ### 23. What is SCA and how do you perform SCA?
 
