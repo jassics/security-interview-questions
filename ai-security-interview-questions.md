@@ -1045,4 +1045,103 @@ flowchart TD
 
 ---
 
+### Scenario 19: A red-team engagement "passed" your new agentic feature two weeks before launch — then it got exploited in production on day three
+
+**Setup**: Before launching an autonomous browsing-and-purchasing agent, security ran a red-team pass: a battery of direct prompt-injection prompts against the chat interface, all of which the model correctly refused. The report concluded "no critical findings." Three days after launch, an attacker plants an injected instruction on a product page the agent visits mid-task, and the agent autonomously completes an unauthorized purchase and forwards order confirmation details to an external address.
+
+**What went wrong with the red-team engagement itself**: The exercise tested the wrong attack surface for what shipped — it validated resistance to **direct** prompt injection through the chat box, but the actual production risk was **indirect** prompt injection through content the *agent* consumes autonomously (web pages, tool outputs) combined with **excessive agency** (unsupervised purchase authority). This is a scoping failure, not a tooling failure: per the OWASP GenAI Red Teaming Guide's approach, a red-team scope has to be driven by the system's actual architecture and blast radius — its tools, autonomy level, and every content channel that reaches the model — not just the most obvious user-facing input box. The OWASP Agentic AI Red Teaming Guide specifically calls out that agentic systems need testing across the tool-use/multi-step-autonomy surface (can the agent be steered into unauthorized tool calls via content it processes mid-task?), which a chat-only injection test never exercises.
+
+**How this should have been scoped and tested:**
+- **Threat-model-first scoping** — before writing a single test prompt, map every trust boundary: user → agent (direct), external content → agent (indirect, via browsing/RAG/tool outputs), agent → tools (what can it actually *do*, and to what blast radius). Red-team every boundary, not just the one that's easiest to poke at from a chat UI.
+- **Indirect injection test cases** — plant injected instructions in content the agent is expected to autonomously process (a crafted product page, a poisoned search result, a malicious file it's asked to summarize) and verify the agent doesn't treat that content as instructions, exactly as in Scenario 15's agentic kill chain.
+- **Excessive-agency-specific tests** — regardless of whether injection succeeds, separately test "if the model's next action were fully attacker-controlled, what's the worst it could do with its granted tools?" and verify high-impact actions (purchases, sends, deletions) require human confirmation, not just that the model *usually* refuses when asked directly.
+- **Multi-turn and cross-channel escalation** — test whether an attack that fails in one turn or one channel succeeds when spread across turns or combined with a second channel (e.g., a subtly-worded direct request that only becomes actionable once paired with attacker-controlled context retrieved later in the same session).
+- **Objective pass/fail bar tied to the real risk**, not "the model refused when asked nicely" — e.g., "0 successful unauthorized tool invocations out of N adversarial indirect-injection runs across every tool the agent can call," reviewed and re-run on every material change to tools, prompts, or autonomy level (this is the same standing-eval discipline as Q30).
+
+**Fixes / process changes:**
+```python
+# Vulnerable: red-team scope defined by "test the chat input," sign-off gate is a single point-in-time report
+red_team_scope = ["direct_prompt_injection_via_chat"]
+
+# Hardened: scope derived from the system's actual trust boundaries and tool inventory,
+# re-run continuously rather than as a one-time pre-launch gate
+red_team_scope = {
+    "direct_injection": ["chat_input"],
+    "indirect_injection": ["browsed_web_content", "retrieved_documents", "tool_output_summaries"],
+    "excessive_agency": [t.name for t in agent.tools if t.impact_tier in ("high", "irreversible")],
+    "multi_turn_escalation": True,
+    "cross_channel_combination": True,
+}
+launch_gate = all(
+    run_adversarial_suite(surface, corpus=ADVERSARIAL_CORPUS[surface]).success_rate == 0.0
+    for surface in red_team_scope
+)
+# and: re-run this exact suite in CI on every prompt/tool/model change, not just pre-launch
+```
+- **Scope red-teaming to the system's trust boundaries and tool inventory**, derived from a threat model, not to whichever input channel is easiest to test.
+- **Treat agentic/tool-use surfaces as a first-class red-team target**, distinct from and in addition to chat-interface injection testing — the OWASP Agentic AI Red Teaming Guide and the broader GenAI Red Teaming Guide both frame this as testing the full attack surface across the AI lifecycle, not a single interaction point.
+- **Make red-teaming continuous, not a pre-launch gate** — new tools, prompt changes, and model upgrades all reopen the attack surface; a report that's two weeks stale by launch is already out of date the moment anything changes.
+- **Combine automated adversarial corpora with manual, goal-directed human red-teaming** ("get the agent to make an unauthorized purchase," not "does it refuse this prompt") — automated tests catch known patterns, human testers find the creative chained attacks that a corpus doesn't anticipate.
+- **Feed every red-team finding back into a permanent regression suite**, exactly as in the jailbreak scenario (Scenario 10) — a finding that gets fixed once but never becomes a standing test will silently regress on the next change.
+
+---
+
+### Scenario 20: Three different teams independently ship GenAI features with wildly inconsistent risk controls — and nobody in security even knew about two of them
+
+**Setup**: During an unrelated audit, your security team discovers that Team A embedded a third-party LLM API directly into a customer-facing feature with no data classification review, Team B built an internal agent with broad database access and no logging, and Team C has been running a fine-tuning pipeline on customer data for months — none of which went through any AI-specific review, because no such review existed. Each team made individually reasonable engineering decisions; there was simply no governance function requiring them to surface AI-specific risk before shipping.
+
+**What likely happened**: This is a **governance/program gap**, not a single technical vulnerability — the organization scaled its AI adoption faster than its AI risk-management program, resulting in "shadow AI" (deployed AI capability the security/risk function has no visibility into) and inconsistent controls across teams doing structurally similar things. This is exactly the gap the **NIST AI Risk Management Framework (AI RMF 1.0 / the AI RMF Playbook)** is designed to close: its four core functions — **Govern** (establish policy, roles, and accountability for AI risk org-wide), **Map** (identify and document context, use cases, and risk for each AI system), **Measure** (assess risk against defined metrics), and **Manage** (prioritize and act on identified risks) — exist precisely so that "does this feature need a security review, and by whom" isn't left to each team's individual judgment. Layered on top, the **NIST Generative AI Profile (AI 600-1)** narrows Map/Measure/Manage to GenAI-specific risks (data privacy, confabulation, harmful content, value-chain/component risk from third-party model APIs), and a management-system standard like **ISO/IEC 42001 (AI Management System)** provides the auditable organizational structure (policies, roles, continual improvement cycle) to operationalize Govern at a company-wide level rather than leaving it ad hoc per team.
+
+**How to diagnose the gap and build the fix, walked through like a governance program design:**
+1. **Govern — establish the function first.** Define who owns AI risk (a cross-functional AI governance body spanning security, legal, privacy, and the AI/ML platform team), and mandate that *any* team integrating a third-party model API, deploying an agent with tool access, or fine-tuning on production data must register the system before launch — this single requirement is what would have surfaced all three teams' work here immediately.
+2. **Map — build the inventory.** Stand up an AI system/use-case inventory (what NIST AI RMF calls establishing context) covering every model API integration, agent, and fine-tuning pipeline in the org — you cannot govern what you don't know exists, and "we found out during an unrelated audit" is the tell that this inventory doesn't exist yet.
+3. **Measure — apply a consistent risk rubric.** For each inventoried system, assess against a standard checklist (data classification touched, autonomy/tool-access level, third-party model provider's data-retention terms, whether it processes regulated data) — Team A, B, and C should all be scored against the *same* rubric, not whatever ad hoc judgment each team happened to apply.
+4. **Manage — prioritize and remediate by actual risk**, not by discovery order: Team C's fine-tuning-on-customer-data pipeline (data privacy + potential memorization/extraction risk, see Scenario 17) is likely higher priority than Team A's API integration if it lacks basic data handling review, but that has to be a deliberate risk-based call, not a coincidence of audit sequencing.
+5. **Operationalize it as a management system, not a one-time cleanup.** An ISO 42001-style AI Management System turns this from a one-off remediation sprint into a recurring cycle — policy, risk assessment, and control verification repeat on a schedule and re-trigger whenever a new AI use case is proposed, so the next Team D doesn't repeat the same gap.
+
+**Fixes (the practical, engineering-facing version of the governance rubric):**
+```python
+# The concrete artifact a governance program produces: a lightweight, mandatory
+# intake gate every team runs through before an AI feature ships, mapped to
+# NIST AI RMF's Map/Measure functions
+class AIRiskIntake:
+    def register(self, system_name, owner, description):
+        risk_profile = {
+            "data_classification": self.classify_data_touched(system_name),      # Map
+            "third_party_model": self.check_provider_data_terms(system_name),    # Map
+            "autonomy_level": self.assess_tool_access(system_name),              # Measure
+            "regulated_data_exposure": self.check_compliance_scope(system_name), # Measure
+        }
+        required_controls = risk_rubric.required_controls_for(risk_profile)      # Manage
+        return AIRiskRecord(system_name, owner, risk_profile, required_controls, status="pending_review")
+
+# Enforcement point: this becomes a hard gate in the deployment pipeline,
+# not a voluntary form teams may or may not fill out
+def deploy_ai_feature(system_name, artifact):
+    record = ai_inventory.lookup(system_name)
+    if record is None or record.status != "approved":
+        raise DeploymentBlocked(f"{system_name} has not cleared AI risk intake")
+    deploy(artifact)
+```
+- **Make AI risk registration a hard gate in the deployment pipeline**, not a policy document nobody reads — Team A/B/C's features should structurally fail to ship without a completed, approved intake record.
+- **Build and maintain a living AI system inventory** — the single most common root cause of "shadow AI" incidents is that no one, including security, has a current list of what AI capability actually exists in production.
+- **Apply the same risk rubric across every team and use case** so risk-based prioritization is possible and defensible, rather than whichever gap gets discovered first getting the most attention.
+- **Use NIST AI RMF's Govern/Map/Measure/Manage structure as the skeleton** for the program itself (not just as a one-time audit checklist), and layer the GenAI Profile (AI 600-1) on top for the LLM-specific risk categories once a system is confirmed to be GenAI-based.
+- **Treat this as a management system with a recurring cycle** (ISO 42001-style: policy → risk assessment → control implementation → monitoring → continual improvement), so governance keeps pace with new AI adoption instead of requiring a fresh emergency audit every time adoption outruns oversight again.
+
+```mermaid
+flowchart TD
+    NEW[New AI use case proposed] --> GOV{Registered with\nAI governance intake?}
+    GOV -- no --> BLOCK[Deployment blocked]
+    GOV -- yes --> MAP[Map: classify data,\nprovider, autonomy level]
+    MAP --> MEASURE[Measure: score against\nstandard risk rubric]
+    MEASURE --> MANAGE[Manage: assign required\ncontrols by risk tier]
+    MANAGE --> REVIEW{Controls\nimplemented?}
+    REVIEW -- no --> REMEDIATE[Remediate before launch]
+    REVIEW -- yes --> APPROVE[Approved: added to\nAI system inventory]
+    APPROVE --> MONITOR[Continual monitoring +\nperiodic re-assessment]
+```
+
+---
+
 *Contributions welcome — add real interview questions/scenarios you've encountered via PR.*
