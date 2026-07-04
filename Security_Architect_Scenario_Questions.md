@@ -20,6 +20,10 @@
 14. [Scenario 14: Build vs. Buy for a Secrets Management Platform](#scenario-14-build-vs-buy-for-a-secrets-management-platform)
 15. [Scenario 15: Designing Secrets Management Architecture at Scale](#scenario-15-designing-secrets-management-architecture-at-scale)
 16. [Scenario 16: End-to-End STRIDE Threat Model Walkthrough — a New "Buy Now, Pay Later" Feature](#scenario-16-end-to-end-stride-threat-model-walkthrough--a-new-buy-now-pay-later-feature)
+17. [Scenario 17: Designing a Container and Kubernetes Security Architecture](#scenario-17-designing-a-container-and-kubernetes-security-architecture)
+18. [Scenario 18: Building a Third-Party and Vendor Risk Management Architecture](#scenario-18-building-a-third-party-and-vendor-risk-management-architecture)
+19. [Scenario 19: Leading Security Due Diligence for an Acquisition](#scenario-19-leading-security-due-diligence-for-an-acquisition)
+20. [Scenario 20: Building an Application Security Program From Zero](#scenario-20-building-an-application-security-program-from-zero)
 
 ## Scenario 1: Hybrid Cloud Migration
 
@@ -445,3 +449,123 @@ flowchart LR
 - **Step 5 — Decide what blocks launch versus what's tracked as accepted/scheduled risk**: Not every finding gets fixed before ship — the webhook-forgery and PII-minimization findings are launch blockers given this feature handles money and regulated financial data; the DoS-degraded-mode design might be accepted as a tracked risk with a committed follow-up date if the provider's SLA makes it low-likelihood — document explicitly which is which, and who accepted the risk, so this decision is auditable later rather than an ambiguous "we knew about it" if something goes wrong.
 
 - **Step 6 — Re-run the delta, not the whole exercise, when the design changes**: If the BNPL provider integration changes (e.g., they later add a new webhook type, or the adapter starts caching credit decisions), threat model *that specific change* against the existing DFD rather than assuming the original model still fully covers it — this is what keeps threat modeling sustainable as a recurring practice (tying back to Scenario 6) instead of a one-time pre-launch exercise that goes stale the moment the feature evolves.
+
+---
+
+## Scenario 17: Designing a Container and Kubernetes Security Architecture
+
+**Question**: Your platform team is standardizing on Kubernetes for all new services. As the security architect, what does "secure by default" look like for this platform, and how do you make sure individual teams can't quietly opt out of it?
+
+### Answer:
+
+- **Secure the supply chain before the cluster — a hardened cluster running a compromised image is still compromised**: Enforce a signed, scanned base-image pipeline (mandatory SCA/vulnerability scanning at build time, blocking on critical CVEs, image signing via Sigstore/cosign) and admission-control policy that **refuses to run any image that isn't signed and scanned** — this closes the "someone pulled a random public image straight from Docker Hub into production" gap that no amount of runtime hardening fixes after the fact.
+
+```mermaid
+flowchart LR
+    DEV[Developer commits] --> BUILD[CI: build image]
+    BUILD --> SCAN{SCA/vuln scan:\ncritical CVEs?}
+    SCAN -- fail --> BLOCK1[Build blocked]
+    SCAN -- pass --> SIGN[Sign image\nvia cosign/Sigstore]
+    SIGN --> REGISTRY[(Trusted registry)]
+    REGISTRY --> ADMISSION{Admission controller:\nsigned + scanned + policy-compliant?}
+    ADMISSION -- no --> REJECT[Pod creation rejected]
+    ADMISSION -- yes --> CLUSTER[Runs in cluster]
+```
+
+- **Make Pod Security Standards and network policy the default, not opt-in per namespace**: Apply the "restricted" Pod Security Standard (no privileged containers, no host namespace/network access, non-root, read-only root filesystem where feasible) at the cluster level via admission control, and default every namespace to a **deny-all NetworkPolicy** that teams must deliberately open specific paths from — defaulting to permissive and asking teams to lock down later never happens at scale; defaulting to restrictive and letting teams request specific exceptions does.
+
+- **Scope RBAC and service accounts per-workload, never share a broad service account across unrelated services**: Every workload gets its own service account with only the Kubernetes API permissions and cloud IAM bindings (via IRSA/Workload Identity, tying back to Scenario 15's identity-based secrets bootstrap) that its specific function needs — a shared "apps" service account with broad `cluster-admin`-adjacent permissions turns any single compromised pod into a cluster-wide incident.
+
+- **Treat the control plane and etcd as the crown jewels they are**: API server access restricted to a private network with strong authentication (no public internet-exposed API server), etcd encrypted at rest and its access tightly scoped (etcd contains every Secret in the cluster in near-plaintext-equivalent form if not properly encrypted) — a surprising number of real-world Kubernetes compromises trace back to an exposed, weakly-authenticated API server or unencrypted etcd, which is a fully preventable, well-understood gap.
+
+- **Instrument for runtime detection, not just admission-time prevention**: Prevention (image scanning, admission control, RBAC) stops known-bad patterns before they run; runtime security tooling (Falco or equivalent) detects the unknown-bad — a process spawning a shell inside a container that should never do that, unexpected outbound network connections, privilege escalation attempts — because admission control alone can't catch a legitimate image being exploited after it's already running.
+
+- **Build the guardrails into the platform, so teams get security for free rather than as homework**: Ship a standard Helm chart / Kustomize base / internal "platform as a product" starting point that already has the Pod Security Standard, default network policy, and scoped service account correctly configured — the same paved-road principle from Scenario 9, applied specifically to the Kubernetes platform layer, so secure configuration is the path of least resistance rather than a checklist a busy team skips under deadline pressure.
+
+- **Prevent policy drift with continuous compliance scanning, not just admission-time checks**: Configuration can drift after deployment (a team manually patches a running deployment to add a capability, an emergency fix loosens a network policy and nobody reverts it) — run continuous policy-as-code scanning (OPA/Gatekeeper, Kyverno policies evaluated on a schedule, not just at admission) against the live cluster state to catch drift from the intended baseline.
+
+---
+
+## Scenario 18: Building a Third-Party and Vendor Risk Management Architecture
+
+**Question**: Your company works with 300+ vendors, ranging from a payroll SaaS provider to a subprocessor that touches customer PII to a marketing analytics tag embedded directly in your website's frontend. How do you architect a third-party risk program that's rigorous where it needs to be and doesn't grind procurement to a halt everywhere else?
+
+### Answer:
+
+- **Tier vendors by access and data sensitivity, not by contract size**: A $2M enterprise software deal with no data access is lower risk than a $200/month tool that gets a service account with broad API access to your customer database — build the tiering criteria around **what the vendor can actually touch or see** (data classification touched, network/API access granted, whether they're a subprocessor for regulated data) rather than around procurement's existing spend-based approval thresholds, which measure the wrong thing entirely for security risk.
+
+- **Right-size due diligence depth to the tier, the same principle as Scenario 10's review-board tiering**: Low-tier vendors (no data access, no system integration) get a lightweight self-attestation questionnaire; high-tier vendors (subprocessors touching regulated data, deep system integration, broad API access) get a full review — security questionnaire (or accept a current SOC 2 Type II / ISO 27001 report in lieu of re-deriving the same answers), architecture review of the actual integration, and a contractual security addendum — applying full-depth review to all 300 vendors uniformly guarantees the program either never finishes or gets rubber-stamped without real scrutiny.
+
+- **Architect the technical integration for least privilege regardless of how much you trust the vendor**: Scope API keys/OAuth grants given to a vendor integration to only the specific data and actions required (a marketing analytics vendor gets event data, not full customer PII access; a payroll vendor's API access is scoped to payroll data only, not the broader HR system) — trusting a vendor contractually doesn't reduce your technical blast radius if their systems are later compromised, so the access-scoping decision has to be made independent of how much you trust them.
+
+```mermaid
+flowchart TD
+    NEW[New vendor requested] --> TIER{Tier by data\nsensitivity + access\ngranted, not spend}
+    TIER -- low --> SELF[Self-attestation\nquestionnaire]
+    TIER -- medium --> DOC[Accept SOC2/ISO27001\n+ scoped questionnaire]
+    TIER -- high --> FULL[Full security review:\nquestionnaire + architecture\nreview + contract addendum]
+    SELF --> SCOPE[Technical access scoped\nto least privilege regardless of tier]
+    DOC --> SCOPE
+    FULL --> SCOPE
+    SCOPE --> REGISTER[Vendor + access\nregistered in inventory]
+    REGISTER --> REASSESS[Scheduled reassessment\n+ continuous monitoring]
+```
+
+- **Maintain a living vendor and integration inventory, tied to your data classification work from Scenario 12**: You need to be able to answer "which vendors have access to this data category" instantly during an incident (a vendor breach elsewhere in the industry, or your own incident investigation) — an inventory that only exists at onboarding time and never gets updated as integrations change becomes useless exactly when you need it most.
+
+- **Continuously monitor rather than one-time-approve and forget**: A vendor's security posture at onboarding doesn't guarantee their posture two years later — track vendor security incidents/breach disclosures (via threat intel feeds or simple news monitoring for high-tier vendors), require periodic re-attestation (annual SOC 2 renewal review at minimum for high-tier vendors), and re-review any vendor whose scope of access materially expands.
+
+- **Build the frontend/JavaScript-tag risk into the same program, since it's an easy blind spot**: Third-party scripts embedded directly in your website (analytics, chat widgets, ad tech) run with the same origin privileges as your own frontend code and are a real, frequently-overlooked class of supply-chain risk (Magecart-style skimming attacks specifically target this) — apply Subresource Integrity (SRI) and a strict Content-Security-Policy to constrain what embedded third-party scripts can actually do, and include frontend script vendors in the same tiering/review process as backend integrations rather than treating "it's just a tracking pixel" as exempt from review.
+
+- **Design the offboarding process with the same rigor as onboarding**: Access revocation, data return/deletion confirmation, and removal from the active inventory when a vendor relationship ends — a huge fraction of real third-party risk exposure comes from **stale access that was never revoked** after a vendor relationship formally ended, not from a sophisticated attack on an actively-used integration.
+
+---
+
+## Scenario 19: Leading Security Due Diligence for an Acquisition
+
+**Question**: Your company is acquiring a smaller startup. You have three weeks before the deal is expected to close, and you're asked to lead the security due diligence. What do you actually do in those three weeks, and what happens after close?
+
+### Answer:
+
+- **Scope the diligence to deal-relevant risk, not a full audit — three weeks isn't enough for a full audit and that's not the goal**: The purpose of pre-close diligence is to surface anything that could materially affect deal value or create immediate post-close liability (an active, undisclosed breach; egregious regulatory non-compliance for a regulated business; critical architecture red flags like hardcoded production credentials in a public repo) — not to produce a comprehensive security assessment, which is a post-close integration task with a realistic timeline instead of a deal-clock timeline.
+
+- **Prioritize a short list of high-signal questions over a generic 200-item questionnaire**: Has the target had a breach or significant security incident in the last 2 years (disclosed or not)? Do they have any active/unremediated critical vulnerabilities in production? What regulated data do they hold and what's their actual compliance posture (not just "we have a SOC 2" — read the actual report and note exceptions) versus their compliance claims? Is there any known IP/security dispute or pending litigation? — these deal-relevant questions surface the findings that actually matter for a go/no-go or price-adjustment conversation.
+
+- **Get read access to real artifacts, not just answers to a questionnaire**: Push for actual access — their vulnerability scan results, a copy of their most recent pen test report, their SOC 2 report (not just the attestation letter, the actual report with any exceptions/qualifications), and if feasible a technical architecture walkthrough with their engineering lead — a startup motivated to close the deal will often answer a questionnaire more optimistically than the underlying evidence supports, so verify rather than take self-reported answers at face value wherever the timeline allows.
+
+- **Explicitly separate "walk away / renegotiate price" findings from "fix after close" findings**: An active, ongoing breach or a fundamental, expensive-to-fix architecture flaw (e.g., their core product has no real authentication model at all) is a **deal-term** conversation — it affects valuation or deal viability, and needs escalation to the deal team immediately, not held for a post-close report; a messy but bounded finding (they're behind on patching, no formal SDLC) is a **post-close integration roadmap item**, not a blocker — miscategorizing either direction either kills a viable deal over a fixable problem or lets a real deal-breaker slide through because it got treated as routine.
+
+- **Plan the technical integration architecture during diligence, even though execution comes after close**: Identify early whether the target's identity/auth system, network, and data stores can realistically federate with the parent company's, or whether they need to be kept fully isolated for a period post-close — this shapes both the initial 90-day integration plan and, in some cases, the deal structure itself if integration complexity turns out to be a material cost.
+
+- **Assume compromise until proven otherwise for the first period post-close**: Treat the acquired company's environment as an untrusted network segment at close — no default trust extended to their systems, credentials, or third-party integrations until your team has independently verified their security posture, since a rushed, fully-open network merge on day one is a common way an acquirer inherits an undiscovered pre-existing compromise as their own incident.
+
+- **Write the 30/60/90-day post-close security integration plan as a diligence deliverable, not an afterthought**: Immediate items (rotate any shared/known secrets, apply your baseline security tooling — EDR, logging, vulnerability scanning — to their environment, revoke any departing-employee access per standard offboarding), medium-term items (bring their SDLC up to your secure-by-design bar per Scenario 9, integrate their services into your threat-modeling and architecture-review processes), and the realistic timeline for full technical integration — this plan is what turns diligence findings into actual remediated risk rather than a report that gets filed away once the deal closes.
+
+---
+
+## Scenario 20: Building an Application Security Program From Zero
+
+**Question**: You're the first dedicated security hire at a 200-engineer company that's shipped product for years with zero formal security function. Where do you actually start, and what does your first 90 days look like?
+
+### Answer:
+
+- **Resist the urge to start with tooling — start with visibility**: Before buying a single scanner, build a real picture of what exists: an application/service inventory, a rough map of what data each service touches, current authentication/authorization patterns, and existing (even informal) security practices any individual engineers already do — you cannot prioritize a program you haven't scoped, and a common first-hire mistake is deploying SAST/DAST tooling everywhere before knowing which 10% of the estate actually carries 90% of the real risk.
+
+- **Find the highest-signal, lowest-effort win first, and make it visible**: A quick, credible early result (running SCA/dependency scanning across the top revenue-critical services and getting a handful of genuinely critical, exploitable CVEs patched in month one) builds the organizational trust and executive air cover you'll need for the harder, slower cultural work later — a security program's first quarter is as much about earning credibility as it is about actual risk reduction, and those two goals are served by different kinds of early wins than a long-term architecture overhaul would be.
+
+- **Sequence the program roughly as: visibility → guardrails → culture, not the reverse**: (1) **Visibility** — asset inventory, dependency/SCA scanning, a basic vulnerability-management process with defined SLAs by severity; (2) **Guardrails** — SAST and secret-scanning in CI/CD as a quality gate (Scenario 9's secure-by-design principle), a minimal secure-coding standard, basic security requirements in the design-doc template; (3) **Culture** — threat modeling program (Scenario 6), security champions (Scenario 7), and a review process (Scenario 10) — attempting to launch a champions program or a formal architecture review board before you have basic vulnerability visibility and CI gates in place means those programs have no real substance to work with yet.
+
+```mermaid
+flowchart TD
+    V[Phase 1 - Visibility:\nasset inventory, SCA/dependency\nscanning, vuln management SLAs] --> G[Phase 2 - Guardrails:\nSAST + secret scanning in CI,\nsecure coding standard,\ndesign-doc security section]
+    G --> C[Phase 3 - Culture:\nthreat modeling program,\nsecurity champions,\narchitecture review board]
+    C --> M[Ongoing:\nmetrics program,\ncontinuous improvement]
+```
+
+- **Get executive sponsorship for the mandate before you need to use it**: A single security hire with no formal mandate will hit a wall the first time a team pushes back on a finding or a deadline conflict — get explicit, communicated-to-engineering-leadership backing for at least a baseline bar (critical vulnerabilities must be fixed within X days, new services need a design review above a certain risk tier) before you're relying on personal relationships alone to get anything prioritized against feature deadlines.
+
+- **Pick a lightweight framework to organize the program, don't build one from scratch**: Use OWASP SAMM or a similarly established application security maturity model to self-assess current state and set a realistic 12–18 month target maturity level per practice area — this gives you a credible, externally-recognized structure to report progress against to leadership, rather than an ad hoc list of initiatives that's hard to communicate as a coherent program.
+
+- **Don't try to do everything yourself — design for scale from month one**: Even as a single hire, make decisions with the champions-program and paved-road mindset in mind from the start (Scenario 7, Scenario 9) — every guardrail you build should be designed so it can eventually run with light touch from a small team supporting many engineers, rather than architecture that assumes you'll personally review everything forever, because headcount will lag well behind the growth of what needs securing.
+
+- **Report progress against risk reduction, not activity, from the very first update**: Even in month one, frame your update to leadership in terms of "critical vulnerability exposure window shrank from unknown/unmanaged to a defined SLA" rather than "we bought a scanner and ran it" — this sets the right expectation early that the program is accountable for outcomes (tying back to Scenario 13's metrics philosophy), which matters enormously for how much investment and authority you're given in year two.
