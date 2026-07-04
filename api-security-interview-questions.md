@@ -21,6 +21,8 @@ API security has become its own specialization, distinct from general web securi
    4. [Scenario 4: GraphQL nested-query resource exhaustion](#scenario-4-graphql-nested-query-resource-exhaustion)
    5. [Scenario 5: Shadow API discovered via mobile app teardown](#scenario-5-shadow-api-discovered-via-mobile-app-teardown)
    6. [Scenario 6: SSRF via a "fetch this URL" webhook/import feature](#scenario-6-ssrf-via-a-fetch-this-url-webhookimport-feature)
+   7. [Scenario 7: GraphQL field-level authorization bypass through query aliasing](#scenario-7-graphql-field-level-authorization-bypass-through-query-aliasing)
+   8. [Scenario 8: gRPC service mesh authenticates every call but authorizes none of them](#scenario-8-grpc-service-mesh-authenticates-every-call-but-authorizes-none-of-them)
 
 ---
 
@@ -305,3 +307,90 @@ def import_from_url(user_supplied_url):
 - **Use a dedicated network egress path for outbound fetches from this kind of feature** (a proxy or dedicated subnet with no route to internal/metadata addresses) as defense-in-depth, so even a validation-logic bug doesn't grant a path to internal resources.
 - **Disable or v2-only cloud instance metadata service access where your cloud provider supports it** (e.g., AWS IMDSv2, which requires a session token via a PUT request that most naive SSRF payloads can't perform) — this is an infrastructure-level control that meaningfully raises the bar even if an application-level SSRF bug exists.
 - **Never reflect a fetched response's raw content back to the requesting user**, especially in error messages/debug output — even with the URL-validation fix in place, treat "don't echo internal fetch results back to the external caller" as an independent defense-in-depth layer.
+
+---
+
+### Scenario 7: GraphQL field-level authorization bypass through query aliasing
+
+**Setup**: Your GraphQL API correctly enforces object-level authorization on the `salary` field of an `Employee` type — a resolver-level check confirms the requesting user is either the employee themselves or their direct manager before returning that field. A penetration test reports they extracted every employee's salary in the company anyway, using a single query that aliases the same field query many times over with different employee IDs, discovering that the authorization check was actually implemented once at the **query root**, not inside the field resolver itself — so it only validated the *first* employee referenced in the request, and every subsequent aliased sub-query slipped through unchecked.
+
+**Root cause**: This is **Broken Object Level Authorization (OWASP API1) manifesting through a GraphQL-specific mechanism** — query aliasing lets a single request ask for the same field multiple times against different arguments in one round trip (`emp1: employee(id: "A") { salary } emp2: employee(id: "B") { salary }`), and if the authorization check is bolted on at a single, top-level middleware/gateway layer rather than genuinely re-executed **inside the resolver for every single field/object instance resolved**, aliasing turns "we checked authorization once" into "we checked authorization for the first of N objects and silently trusted the rest." This is exactly the GraphQL-shaped version of the general principle from Q14: authorization has to live at the resolver level because the client controls arbitrarily-shaped, arbitrarily-repeated traversals of the graph in a single request.
+
+**Fix:**
+```javascript
+// Vulnerable: authorization checked once, at the query-root level, assuming one employee per request
+const resolvers = {
+  Query: {
+    employee: async (_, { id }, context) => {
+      await authorizeOnce(context.user, id);   // runs once per resolved root field call... but see below
+      return db.employees.findById(id);
+    },
+  },
+  Employee: {
+    salary: (employee) => employee.salary,   // no independent check here — trusts that Query.employee already did it
+  },
+};
+// Aliasing (emp1: employee(id:"A"){salary} emp2: employee(id:"B"){salary}) calls Query.employee
+// twice, once per alias — so this actually *does* re-run per alias in most engines. The real-world
+// version of this bug is subtler: a DataLoader/batching layer that fetches multiple employees in
+// one batched DB call and applies the authorization check against only the *first* ID in the batch,
+// or a resolver that memoizes/caches the authorization result per request instead of per object.
+
+// Hardened: authorization check runs inside the field resolver itself, per object instance,
+// with no caching/memoization across different object IDs within the same request
+const resolvers = {
+  Employee: {
+    salary: async (employee, _, context) => {
+      const authorized = await authorize(context.user, "read:salary", employee.id);  // per-instance, every time
+      if (!authorized) return null;   // or throw, per your API's error-handling convention
+      return employee.salary;
+    },
+  },
+};
+```
+- **Enforce authorization inside the field resolver for every sensitive field, keyed to the specific object instance being resolved** — never assume a check performed on the query's root field, or on the first item in a batch, covers every object the query ultimately touches; GraphQL's aliasing and nested-selection capabilities mean a "one check per request" mental model is the wrong mental model entirely.
+- **Audit any DataLoader/batching layer specifically for this exact bug**: batching (fetching many objects' data in one underlying DB call for efficiency) is a common, legitimate GraphQL performance pattern, but if the authorization check was written against the batch as a whole (or against the first/primary ID) rather than per resolved item, batching silently reintroduces this vulnerability even when the naive single-object resolver code looks correct.
+- **Test explicitly with aliased and batched queries, not just single-object queries**, during both development and pentest — a manual test that only ever requests one object per query will never trigger this class of bug, since it's specifically the multi-object, single-request shape that exposes the gap.
+- **Prefer a schema-directive-based or centralized authorization framework** (e.g., a `@requiresRole` / `@authz` directive applied declaratively on sensitive fields in the schema definition, enforced by the GraphQL engine itself before resolution) over hand-rolled per-resolver checks — a declarative, engine-enforced approach is far less likely to have a batching/aliasing-shaped gap than authorization logic scattered across individually-written resolver functions.
+- **Log field-level access to sensitive data (who read which employee's salary, when) independent of whether the request "looked normal"** — this is what makes a bulk-exfiltration-via-aliasing attack detectable after the fact even if it's missed at request time, since the access pattern (one account reading hundreds of salary fields in a short window) is a strong anomaly signal regardless of how the underlying query was shaped.
+
+---
+
+### Scenario 8: gRPC service mesh authenticates every call but authorizes none of them
+
+**Setup**: Your internal microservices communicate over gRPC through a service mesh (mTLS enforced everywhere, every service has a verified certificate identity). During an incident investigation, you discover the `billing-service` accepted and processed a `VoidInvoice` RPC call originating from the `recommendation-service` — a service that has no legitimate business reason to ever call that method — and nothing in the architecture would have prevented it, because "the mesh handles security" had been the team's mental model from day one.
+
+**Root cause**: This is **Broken Function Level Authorization (OWASP API5)** at the service-to-service layer — mTLS via the service mesh is a strong **authentication** control (every service can cryptographically prove its identity to every other service), but authentication alone answers "who is calling," not "should this specific caller be allowed to call this specific method." Teams frequently conflate the two once mTLS is in place ("it's authenticated internal traffic, so it's trusted") and skip building any actual per-method, per-caller authorization policy — meaning any compromised internal service (via a dependency vulnerability, a supply-chain issue, or a misconfiguration) can call *any* RPC method on *any* other service in the mesh, turning a single-service compromise into a mesh-wide blast radius.
+
+**Fix:**
+```protobuf
+// The gap: a gRPC service definition with no notion of which callers are
+// permitted to invoke which methods — mTLS only tells you the caller's identity
+service BillingService {
+  rpc GetInvoice(GetInvoiceRequest) returns (Invoice);
+  rpc VoidInvoice(VoidInvoiceRequest) returns (VoidInvoiceResponse);   // anyone with a valid mesh identity can call this
+}
+```
+```python
+# Hardened: an interceptor enforces an explicit allow-list of which authenticated
+# service identities may call which methods, independent of mTLS having already succeeded
+SERVICE_METHOD_POLICY = {
+    "VoidInvoice": {"payments-orchestrator", "billing-admin-console"},   # explicit allow-list, least privilege
+    "GetInvoice": {"payments-orchestrator", "customer-portal-service", "billing-admin-console"},
+}
+
+class AuthorizationInterceptor(grpc.ServerInterceptor):
+    def intercept_service(self, continuation, handler_call_details):
+        caller_identity = get_verified_identity_from_mtls_cert(handler_call_details)  # from the mTLS cert, not headers
+        method_name = handler_call_details.method.split('/')[-1]
+        allowed_callers = SERVICE_METHOD_POLICY.get(method_name, set())
+        if caller_identity not in allowed_callers:
+            raise PermissionError(f"{caller_identity} is not authorized to call {method_name}")
+        return continuation(handler_call_details)
+```
+- **Never treat mesh-enforced mTLS as sufficient authorization** — mTLS is authentication (proving identity), and needs to be paired with an explicit, maintained per-method authorization policy (an allow-list or a policy-as-code rule set) that answers "given this verified caller identity, is *this specific method* permitted" — the same authentication-vs-authorization distinction from Q3, applied to service-to-service calls instead of end-user API calls.
+- **Derive the caller identity from the verified mTLS certificate itself, never from a self-reported header or metadata field** — a gRPC call can include arbitrary metadata that a compromised caller controls; only the mesh-verified certificate identity is a trustworthy signal to authorize against (this is the same lesson as the multi-agent impersonation risk of trusting a self-asserted identity field instead of a cryptographically verified one).
+- **Apply least privilege per service-to-service relationship, scoped to the minimum method set each caller actually needs** — `recommendation-service` should structurally be unable to reach `billing-service.VoidInvoice` at all, not merely "unlikely to call it because it has no reason to," since the entire point of this control is to contain what a *compromised* version of a legitimate service can do, not to trust that legitimate services will only make legitimate calls.
+- **Enforce authorization policy centrally and declaratively where the mesh supports it** (e.g., a service mesh's own authorization-policy resources, or an interceptor pattern applied consistently across every service) rather than expecting each service team to hand-write and remember to include their own per-method checks — a policy that depends on every team independently getting this right will have gaps exactly like the one this incident found.
+- **Treat this as a mandatory finding in any zero-trust or service-mesh migration review** (tying back to the [Security Architect zero-trust and microservices-migration scenarios](Security_Architect_Scenario_Questions.md#scenario-4-implementing-zero-trust-architecture)) — "we deployed mTLS everywhere" is a common, dangerously incomplete milestone that teams mistake for "we implemented zero trust," when zero trust specifically requires per-request authorization decisions, not just strong identity verification.
+- **Log and alert on cross-service calls that don't match the expected service-dependency graph**, independent of whether the authorization policy blocked them — an unexpected caller successfully reaching a sensitive method (or even being denied but still attempting it) is a strong signal of either a misconfiguration or an active compromise, and is exactly the kind of anomaly that's invisible if your only observability is "was the mTLS handshake successful."
