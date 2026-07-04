@@ -44,6 +44,8 @@ References used while compiling this guide: OWASP Top 10 for LLM Applications (2
     26. [Scenario 26: Coordinated disclosure of a prompt-injection PII leak](#scenario-26-an-external-researcher-emails-you-a-working-prompt-injection-exploit-that-exfiltrated-a-real-customers-pii-from-your-production-rag-chatbot-before-youd-even-started-your-incident-response)
     27. [Scenario 27: Few-shot / in-context-learning example-bank poisoning](#scenario-27-someone-poisons-your-shared-example-bank-and-every-classification-made-using-in-context-learning-silently-shifts-without-anyone-touching-a-training-pipeline-or-the-system-prompt)
     28. [Scenario 28: Model watermark evasion and false-positive enforcement](#scenario-28-your-text-generation-apis-watermark-gets-stripped-by-a-one-line-paraphrase-attack-and-separately-it-falsely-accuses-a-legitimate-customer-of-tos-violation)
+    29. [Scenario 29: Hallucinated legal citations filed in court](#scenario-29-your-internal-legal-research-assistant-confidently-cites-three-court-cases-and-none-of-them-exist)
+    30. [Scenario 30: Chatbot-invented policy creates real legal liability](#scenario-30-your-customer-service-chatbot-invents-a-refund-policy-that-never-existed-and-a-court-holds-you-to-it-anyway)
 
 ---
 
@@ -1556,6 +1558,96 @@ def enforce_after_human_review(case, reviewer_decision):
 - **Give a fast, meaningful appeal/contest path** before or immediately upon any enforcement action, the same principle as Scenario 24's content-moderation appeals — a wrongly-suspended legitimate customer needs a way to be heard quickly, not just a ticket into a generic support queue.
 - **Track and report watermark evasion attempts back to the model/detector team as a standing signal**, similar to the jailbreak regression corpus in Scenario 10 — as paraphrasing/evasion tools evolve, your detector's real-world robustness will need to be re-measured periodically rather than assumed to hold indefinitely from a one-time launch evaluation.
 - **Be explicit with legal/trust-and-safety stakeholders that watermarking is a deterrence and detection aid, not a cryptographic guarantee** — set expectations correctly up front so that "the watermark didn't hold up against a determined attacker" is treated as an expected, planned-for limitation rather than an unanticipated failure when it inevitably happens.
+
+---
+
+### Scenario 29: Your internal legal-research assistant confidently cites three court cases — and none of them exist
+
+**Setup**: Your firm rolls out an LLM-based research assistant to help associates draft motions faster. An associate asks it to find supporting precedent for an argument, and it returns a well-formatted, professionally-worded response citing three case names, docket numbers, and holdings — all plausible-sounding, all fabricated. The associate, trusting the tool's confident tone and correct-looking citation format, includes them in a filed court document. Opposing counsel can't find the cases; the fabrication becomes a sanctionable, publicly embarrassing incident (this exact failure mode has happened in real reported cases where attorneys were sanctioned for LLM-fabricated citations).
+
+**What likely happened**: This is **hallucination/misinformation (OWASP LLM09)** in its highest-stakes form — the model generated fluent, structurally correct, entirely fabricated content because that's what a language model does when it lacks grounded knowledge of a specific fact and is asked to produce something in a familiar format: it produces the most statistically plausible continuation, which for a legal citation looks exactly like a real one. The deeper failure isn't that the model hallucinated (all LLMs do, at some rate, especially for long-tail factual specifics like exact case citations) — it's that the **system design gave a fluent, unverified claim the same visual and tonal authority as a verified one**, and there was no mandatory grounding or verification step between generation and reliance, despite this being a domain (legal filings) with an unusually severe cost of being wrong.
+
+**How to confirm/investigate:**
+- Reproduce the failure mode systematically: run a battery of citation-requiring queries and check what fraction of returned citations correspond to real, verifiable cases versus fabricated ones — this gives you a baseline hallucination rate for this specific use case rather than treating the incident as a one-off fluke.
+- Check whether the assistant is grounded in an actual legal database/RAG source for case law, or is relying purely on the base model's parametric memory — an ungrounded generative request for specific factual citations is close to the worst-case setup for hallucination, since the model has no external source to check itself against.
+- Review whether the output included any confidence signal, sourcing, or disclaimer distinguishing "retrieved from a verified case-law database" from "generated from general knowledge," or whether every response looked equally authoritative regardless of its actual grounding.
+- Assess the human-review step that failed: was there a firm policy requiring independent citation verification before filing, and if so, why didn't it catch this — a process gap (verification required but skipped) and a tooling gap (no way to verify) call for different fixes.
+
+**Fixes:**
+```python
+# Vulnerable: ungrounded generation for a task that requires verifiable, specific facts,
+# with no distinction in the output between "retrieved fact" and "generated text"
+def legal_research_query(question):
+    return llm.generate(f"Find case law supporting: {question}")   # pure parametric recall, unverifiable
+
+# Hardened: ground factual/citation-bearing claims in a verified source, and make the
+# distinction between grounded and ungrounded content explicit and mechanically enforced
+def legal_research_query(question):
+    candidate_cases = case_law_database.search(question)     # retrieval against a real, verified corpus
+    if not candidate_cases:
+        return "No verified precedent found in the case-law database for this query."  # refuse to fabricate
+
+    response = llm.generate(
+        system="Only reference the provided cases. Do not invent case names, citations, or holdings.",
+        context=candidate_cases,
+        question=question,
+    )
+    verified_citations = [c for c in extract_citations(response) if c in {c.id for c in candidate_cases}]
+    if len(verified_citations) < len(extract_citations(response)):
+        flag_for_review(response, reason="response contains citations not present in retrieved source set")
+    return response, {"grounded_in": [c.id for c in candidate_cases]}   # explicit provenance attached to output
+```
+- **Ground high-stakes factual claims in retrieval against a verified source, and refuse (rather than guess) when nothing relevant is found** — "I don't have a verified source for this" is a categorically better output than a fluent fabrication, and the system should be explicitly designed to prefer refusal over confident invention for this class of query.
+- **Mechanically verify that every citation/fact in the output actually traces back to the retrieved source set** before returning it — don't rely on the system prompt instruction ("only cite provided cases") alone, since models don't perfectly follow grounding instructions; add a programmatic check that flags any claim not traceable to a real retrieved source.
+- **Make groundedness visible in the UI, not just enforced in the backend** — show inline citations/links to the actual source document for grounded claims, so a human reviewer can distinguish "this came from a verified case" from "this needs independent checking" at a glance, rather than every sentence looking equally authoritative.
+- **Mandatory, tooling-supported human verification before any high-stakes use** (filing a legal document, making a medical claim, publishing a financial figure) — and make the verification step frictionless enough that it actually gets followed under deadline pressure, since a technically-correct policy that gets skipped in practice provides no real protection.
+- **Track and report hallucination rate as a first-class production metric** for any high-stakes factual-generation feature, the same way you'd track any other quality/safety metric, rather than only learning about the failure mode when an external party (in this case, opposing counsel and eventually a judge) catches it.
+
+---
+
+### Scenario 30: Your customer-service chatbot invents a refund policy that never existed — and a court holds you to it anyway
+
+**Setup**: A customer asks your airline/retail support chatbot about a bereavement-fare or late-refund policy. The chatbot, with no grounding in your actual, current policy documents, generates a plausible-sounding but incorrect answer — it invents a more generous policy than the one that actually exists (this mirrors a real, widely-reported case where an airline was held liable for its chatbot's fabricated policy statement). The customer relies on the chatbot's answer, is later denied the promised treatment by a human agent citing the real policy, escalates, and in the resulting dispute your company is held responsible for what the chatbot told the customer — the "the bot was wrong, not us" defense doesn't hold up, because from the customer's reasonable perspective, the chatbot **is** an authorized representative of the company.
+
+**What likely happened**: This is **misinformation/hallucination (OWASP LLM09)** crossing directly into **legal and financial liability**, and it's worth stating the core lesson explicitly in an interview: a chatbot's hallucinated claim about your company's own policies, prices, or commitments isn't just an "AI accuracy problem" — courts and regulators increasingly treat it as **your company's statement**, full stop, with the same weight as if a human employee had said it. The root technical cause is the same as Scenario 29: the model generated a fluent, confident-sounding answer about specific, factual, verifiable company policy without being grounded in the actual current policy document, and nothing in the system distinguished "I'm citing our real, current policy" from "I'm generating something plausible."
+
+**How to confirm/investigate:**
+- Test the chatbot with a representative sample of policy/pricing/commitment questions and manually verify each answer against the actual current policy documents — measure how often it's wrong, not just whether it *can* be wrong, since remediation priority depends on actual observed rate, not theoretical possibility.
+- Check whether policy-related responses are grounded via RAG against the actual, version-controlled policy documents, or generated from the base model's general training knowledge (which likely includes outdated or generic industry-norm policies rather than your company's specific, current terms).
+- Review whether policy answers carry any indication of currency/authority (e.g., "per our policy last updated [date]" with a link to the source document) versus reading as an unattributed, generically confident statement indistinguishable from marketing copy.
+- Assess the legal/liability review process for customer-facing AI statements — was legal ever consulted on what the chatbot is allowed to represent as company policy, and is there a defined scope of topics it should refuse to answer definitively (e.g., "I can't quote an exact policy for that — let me connect you with an agent") versus topics it's grounded and authorized to answer confidently?
+
+**Fixes:**
+```python
+# Vulnerable: chatbot answers policy questions from general model knowledge,
+# with no grounding in the company's actual current policy documents
+def handle_policy_question(question):
+    return llm.generate(f"As a helpful airline support agent, answer: {question}")  # pure hallucination risk
+
+# Hardened: policy-specific answers are strictly grounded in a version-controlled
+# policy source, with explicit refusal when no matching policy is found, and
+# an audit trail linking every policy statement back to its authoritative source
+def handle_policy_question(question):
+    policy_doc = policy_database.search(question, min_relevance=POLICY_MATCH_THRESHOLD)
+    if not policy_doc:
+        return ("I don't have a specific policy on file for that — "
+                 "let me connect you with a support agent who can confirm the details.")  # refuse, don't guess
+
+    response = llm.generate(
+        system="Summarize ONLY the provided policy text. State the policy's last-updated date. "
+               "Never state a policy detail not present in the provided text.",
+        context=policy_doc.text,
+        question=question,
+    )
+    audit_log.record(question=question, policy_source=policy_doc.id,
+                      policy_version=policy_doc.version, response=response)  # traceable, defensible record
+    return response
+```
+- **Ground every customer-facing statement about company policy, pricing, or commitments in a version-controlled, authoritative source** — treat this exactly like the legal-citation grounding in Scenario 29: refuse and hand off to a human rather than generate a plausible-but-unverified answer, for any question where being wrong has real financial or legal consequence.
+- **Legal/compliance sign-off on the chatbot's authorized scope** — explicitly define which categories of question the bot is grounded and permitted to answer definitively, versus which categories always route to a human, and treat this as a governance decision (tie back to Scenario 20's intake process) rather than something engineering decides unilaterally.
+- **Attach provenance and currency to every policy answer** (source document, version/last-updated date) both for the customer's benefit and to create a defensible audit trail if a statement is later disputed — "here's exactly what source and version produced this answer" is a materially different legal position than "the model said something, we're not sure why."
+- **Treat a chatbot's statements as binding company communications in your risk model**, not as a disclaimed, best-effort tool — a "for informational purposes only, not a guarantee" disclaimer buried in terms of service has repeatedly failed to shield companies from liability for confidently-stated, specific factual claims a reasonable customer relied on; the technical fix (grounding + refusal) is more durable than the legal disclaimer.
+- **Monitor for and rapidly correct policy drift** — even a grounded system fails if the underlying policy database isn't kept in sync with the actual, current company policy, so this needs an operational owner and update process, not just a one-time RAG integration.
 
 ---
 
