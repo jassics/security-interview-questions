@@ -26,6 +26,8 @@
 20. [Scenario 20: Building an Application Security Program From Zero](#scenario-20-building-an-application-security-program-from-zero)
 21. [Scenario 21: Designing an Insider Threat Program and Architecture](#scenario-21-designing-an-insider-threat-program-and-architecture)
 22. [Scenario 22: Designing SaaS Multi-Tenancy Isolation Architecture](#scenario-22-designing-saas-multi-tenancy-isolation-architecture)
+23. [Scenario 23: Designing a Cryptography and Key Management Architecture](#scenario-23-designing-a-cryptography-and-key-management-architecture)
+24. [Scenario 24: Reviewing an SSO/Federation Design Before Rollout](#scenario-24-reviewing-an-ssofederation-design-before-rollout)
 
 ## Scenario 1: Hybrid Cloud Migration
 
@@ -643,3 +645,68 @@ flowchart LR
 - **Test tenant isolation as a dedicated, standing security control, not an assumed property of "we wrote the code carefully"**: Build automated tests that specifically attempt cross-tenant access (authenticated as Tenant A, attempt to read/write Tenant B's known resources across every endpoint) and run them on every deployment, and include tenant-isolation-bypass attempts as an explicit, mandatory category in any penetration test scope for the platform — this is exactly the kind of property that "looks correct" in code review for every individual endpoint while still having exactly one gap somewhere that a systematic, automated cross-tenant test suite will catch and a code reviewer reading one file at a time will not.
 
 - **Plan for tenant-tier upgrades/downgrades in the isolation architecture from the start**: When a customer on the shared/pooled tier needs to move to a dedicated/siloed tier (common as enterprise customers demand stronger guarantees, often contractually), the migration path (data migration, cutover, decommissioning the pooled-tier copy of their data) needs to be a designed, tested process — discovering this need only when your first enterprise customer's contract requires it, with no existing migration tooling, turns a sales-cycle requirement into a security-architecture fire drill.
+
+---
+
+## Scenario 23: Designing a Cryptography and Key Management Architecture
+
+**Question**: An audit finds that encryption at your company is inconsistent — some services use AES-256, one legacy service still uses 3DES, key rotation has never happened for several long-lived keys, and one team hardcoded an encryption key in application config because "the KMS integration was taking too long." As the security architect, how do you design a company-wide cryptography and key management architecture that actually gets adopted?
+
+### Answer:
+
+- **Never let individual teams choose their own cryptographic algorithms or roll their own crypto — provide a small, vetted, mandatory toolkit instead**: The 3DES-legacy and hardcoded-key findings both trace back to the same root cause — teams making their own cryptographic decisions under their own time pressure with no centralized guidance or guardrail. Publish a short, opinionated standard (approved algorithms only — AES-256-GCM for symmetric, RSA-3072/ECDSA-P256 or better for asymmetric, Argon2id for password hashing — with everything else explicitly disallowed) and, more importantly, ship it as **a library/SDK that does the right thing by default**, not just a document — a team reaching for `encrypt(data)` from the sanctioned internal crypto library should get the correct, current algorithm automatically, with no cryptographic decision left for them to get wrong.
+
+- **Centralize key management in a KMS/HSM-backed platform, and make it easier to use correctly than to hardcode a key**: The hardcoded-key incident happened because the secure path (KMS integration) was perceived as slower than the insecure path (paste a key into config) — this is a usability failure of the secure option, not a training failure of the developer, and the fix is making the secure path the fast path: a well-documented, low-friction SDK wrapping your KMS (AWS KMS/Azure Key Vault/GCP KMS or an HSM-backed solution like a dedicated on-prem HSM for the highest-sensitivity keys) that a team can integrate in under an hour, tied into the same identity-based access pattern from the [secrets management architecture scenario](#scenario-15-designing-secrets-management-architecture-at-scale).
+
+```mermaid
+flowchart TD
+    APP[Application] -->|Request data key,\nidentity-based auth,\nno static credential| KMS[KMS / HSM]
+    KMS -->|Wrapped data encryption key\n(DEK), short-lived| APP
+    APP -->|Encrypt/decrypt locally\nusing DEK, envelope encryption| DATA[(Encrypted Data)]
+    KMS --> ROTATE[Automated key rotation\non defined schedule]
+    KMS --> AUDIT[Every key operation\nlogged: who, what key,\nwhen, for what purpose]
+```
+
+- **Use envelope encryption as the standard pattern, not direct encryption with a KMS master key**: Data is encrypted locally with a per-object/per-record Data Encryption Key (DEK), and only the (much smaller, much less frequently used) DEK itself is encrypted ("wrapped") by the KMS's master key — this avoids sending bulk data through the KMS for every operation (a latency and cost problem at scale) while still centralizing ultimate key control and audit in the KMS, and it means key rotation of the master key doesn't require re-encrypting every piece of data, only re-wrapping the DEKs.
+
+- **Automate key rotation and make it non-disruptive, applying the exact same principle as secrets rotation from Scenario 15**: Long-lived, never-rotated keys are a standing risk (the longer a key lives, the more exposure a single compromise represents, and the harder it becomes to rotate later once dependent systems have hardcoded assumptions about key lifetime) — build rotation into the KMS-integrated pattern from day one (versioned keys, applications reference "current" key version, old versions retained only long enough to decrypt already-encrypted data) so rotation is a scheduled, automatic, low-drama event rather than a rare, risky, manually-coordinated one.
+
+- **Distinguish key management from key *usage* policy, and enforce both**: Who can request a key to *exist*, and who can actually *use* it to encrypt/decrypt, are different authorization questions — apply least privilege to key usage specifically (a service that encrypts customer PII shouldn't necessarily have decrypt rights if it never needs to read the data back, e.g., a write-only ingestion service), and audit every key operation (not just key creation) so a compromised service's actual cryptographic activity is visible, not just its existence.
+
+- **Have an explicit, tested plan for algorithm/key-size deprecation and migration, including post-quantum readiness on the horizon**: The 3DES finding is exactly what happens without this — a cryptographic choice made years ago that nobody owns the responsibility to revisit gets discovered as a problem only during an audit; maintain a living inventory of what's encrypted with what algorithm/key size, a defined deprecation timeline for anything falling below current standards, and increasingly, a first-pass assessment of which systems handle long-lived sensitive data that would need crypto-agility for a future migration to post-quantum-resistant algorithms (per NIST's post-quantum cryptography standardization) — this doesn't need to be solved today, but "we have no idea which of our systems even use which algorithms" is the finding that needs closing first, before a PQC migration plan is even possible to scope.
+
+- **Make the audit finding itself the forcing function for a durable fix, not a one-time remediation**: Fix the specific hardcoded key and the 3DES legacy service (immediate remediation), but also add "cryptographic implementation review" as a standing checklist item in the architecture review board (Scenario 10) and a secret/hardcoded-credential scanning rule specifically tuned to catch hardcoded key material (not just API tokens) in CI — an audit finding that only produces point fixes without a structural change to prevent recurrence will very likely surface the same class of issue again in the next audit cycle.
+
+---
+
+## Scenario 24: Reviewing an SSO/Federation Design Before Rollout
+
+**Question**: Your company is rolling out SSO so employees can access dozens of internal and third-party SaaS applications with one company identity, using your identity provider (IdP) to federate via SAML and OIDC. Before this goes live, you're asked to review the design. What do you look for?
+
+### Answer:
+
+- **Verify the IdP is the actual root of trust, and that nothing downstream can bypass it**: Confirm every integrated application genuinely delegates authentication to the IdP with no fallback to a local username/password login path left enabled "just in case" — a leftover local-auth path on even one integrated SaaS app is a complete bypass of every SSO control (MFA enforcement, conditional access, deprovisioning) you're about to roll out, and audit specifically for this rather than assuming "we set up SSO" means local auth was actually disabled everywhere.
+
+- **Check SAML assertion and OIDC token validation rigor on every relying party (service provider), not just at the IdP**: The IdP issuing a correctly-signed assertion is necessary but not sufficient — the receiving application must correctly verify the signature (against the right, current signing certificate, with certificate rotation handled), validate the assertion's audience (`aud`)/recipient fields (so an assertion issued for App A can't be replayed against App B), and enforce assertion expiry/replay protection — SAML implementations in particular have a well-documented history of signature-wrapping and XML-parsing vulnerabilities in the *service provider's* validation code, so this needs review per-integration, not assumed correct because "it's SAML, which is a standard."
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant SP as Service Provider (SaaS app)
+    participant IdP as Identity Provider
+    User->>SP: Attempt access
+    SP->>User: Redirect to IdP for auth
+    User->>IdP: Authenticate (+ MFA per conditional access policy)
+    IdP->>User: Signed SAML assertion / OIDC token,\nscoped to THIS SP's audience, short-lived
+    User->>SP: Present assertion/token
+    SP->>SP: Verify signature against current IdP cert,\ncheck audience matches self,\ncheck not expired/replayed
+    SP-->>User: Access granted
+```
+
+- **Confirm deprovisioning is centralized and actually propagates, not just "SSO login is disabled"**: The entire point of federation from a security standpoint is that disabling one identity in the IdP should cut off access everywhere — verify this is actually true per integrated app (some SAML/OIDC integrations only gate the *login* step, while an application with its own separate session/API-token system might let an already-authenticated session or a previously-issued API token continue working after the IdP-side account is disabled) — test an actual deprovisioning event end-to-end against a sample of integrated apps before relying on this as your primary offboarding control (tying back to the offboarding-as-a-security-control lesson from Scenario 21).
+
+- **Enforce MFA and conditional access at the IdP, and verify it can't be bypassed per-application**: Centralizing auth is valuable specifically because it lets you enforce MFA and risk-based conditional access (block or step-up-challenge logins from unexpected geographies/devices) consistently across every integrated app from one policy point — check whether any application has its own separate, weaker enrollment or recovery path that circumvents this (a "forgot password" flow on the SaaS app itself that doesn't route through the IdP is exactly this kind of bypass) and close it as part of the rollout, not as a follow-up.
+
+- **Design service-to-service and non-interactive authentication as a separate concern from user SSO**: SAML/OIDC federation is designed around an interactive human login flow; background jobs, service accounts, and API integrations need their own pattern (service-account credentials via the KMS/secrets architecture from Scenarios 14-15, or OAuth2 client-credentials grant flows) — a common design mistake is stretching interactive SSO patterns to cover machine-to-machine access, or the opposite failure of leaving service accounts entirely outside the new SSO governance and still using old, ungoverned static credentials that don't benefit from any of the new centralized controls.
+
+- **Plan for IdP compromise as its own top-tier incident scenario, since federation concentrates blast radius by design**: The architectural benefit of SSO (one identity, one place to manage access, one place to revoke) is also its central risk — a compromised IdP, or a compromised admin account within it, is now a single point of failure for access to *every* federated application at once, which is categorically different from the pre-SSO world where a single compromised credential typically only affected one application; ensure the IdP itself gets your highest tier of security controls (dedicated MFA hardware keys for IdP admins, break-glass emergency access procedures per the pattern from Scenario 15, and its own dedicated incident-response runbook), and make sure your incident-response plan (tying back to the AI-focused [incident-response scenario](ai-security-interview-questions.md#scenario-25-2-am-page-your-llm-assistant-is-actively-leaking-other-customers-data-in-production-walk-through-the-first-60-minutes) elsewhere in this repo's playbook philosophy, applied here to identity infrastructure) explicitly covers "the IdP itself is compromised," including a tested plan for revoking trust and re-establishing federation from a known-clean state.
