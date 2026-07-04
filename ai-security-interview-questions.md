@@ -1144,4 +1144,108 @@ flowchart TD
 
 ---
 
+### Scenario 21: A rogue agent joins your multi-agent orchestration and impersonates the "verified compliance reviewer" role — and every other agent believes it
+
+**Setup**: Your platform runs a multi-agent workflow for processing loan applications: an intake agent extracts data, a risk-scoring agent evaluates it, and a compliance-reviewer agent must sign off before approval. Agents communicate over a shared message bus, identifying each other purely by a `role` field in the message payload (e.g., `{"from_role": "compliance_reviewer", "verdict": "approved"}`). An incident review finds that a debugging/test agent left running in the same environment — with no distinct identity or credential — was able to post messages claiming the `compliance_reviewer` role, and the risk-scoring agent accepted its "approved" verdicts without question, resulting in loans being approved with no real compliance check ever having run.
+
+**What likely happened**: This is **agent impersonation / lack of mutual authentication in a multi-agent system** — a distinct multi-agent risk from Scenario 5's confused-deputy handoff problem (where a *legitimate* agent's output was trusted uncritically) because here the deeper issue is that **role/identity itself was self-asserted and unverified**, so any process capable of posting to the bus could claim to *be* any agent, not just influence one. This class of attack is exactly what the research on communication-channel attacks against LLM multi-agent systems studies: once agents coordinate via a shared channel, the channel itself becomes an attack surface — and if identity on that channel is just a string in the payload rather than something cryptographically verified, "impersonation" isn't even an exploit, it's the intended, unauthenticated design working exactly as built.
+
+**How to confirm/investigate:**
+- Check whether inter-agent messages carry any authenticated identity (signed token, mTLS client identity, service-to-service auth) versus a self-declared `role`/`from` field that any sender can set to anything.
+- Reproduce: have a test process post a message claiming a privileged role and confirm whether downstream agents act on it without any identity verification — if this works, the finding generalizes to every privileged role in the system, not just `compliance_reviewer`.
+- Audit for other agents/services with network access to the message bus that shouldn't be there at all (the debugging agent in this case) — an impersonation vulnerability is only exploitable if something untrusted can reach the channel in the first place, so both the authentication gap and the network exposure need fixing.
+- Review whether the compliance-reviewer role's "approval" is logged with enough context (which process, which credential, at what time) to distinguish a real review from an impersonated one during the audit — if not, you may not be able to fully scope how many past approvals were affected.
+
+**Fixes:**
+```python
+# Vulnerable: identity is a self-asserted field in the message payload —
+# anyone who can publish to the bus can claim to be any agent
+def handle_message(message):
+    if message["from_role"] == "compliance_reviewer" and message["verdict"] == "approved":
+        finalize_loan(message["application_id"])   # trusts the claimed role with no verification
+
+# Hardened: every agent has a cryptographically verifiable identity, and
+# privileged roles require an authenticated credential, not a payload field
+def handle_message(message, sender_identity):   # sender_identity comes from mTLS/signed-JWT verification,
+                                                  # never from the message body itself
+    if sender_identity.role != "compliance_reviewer" or not sender_identity.verified:
+        reject_message(message, reason="unauthenticated or unauthorized sender")
+        return
+    if not sender_identity.has_capability("issue_compliance_verdict"):
+        reject_message(message, reason="capability not granted to this identity")
+        return
+    if message["verdict"] == "approved":
+        finalize_loan(message["application_id"], approved_by=sender_identity.agent_id)  # auditable, real identity
+```
+- **Give every agent a distinct, cryptographically verifiable identity** (mTLS client certs, signed tokens per agent instance) — role must be a property the *platform* asserts about a verified identity, never a field the sender gets to write into its own message.
+- **Authorize by capability, not by claimed role** — even a legitimately-identified agent should only be able to invoke the specific actions its function requires (the multi-agent equivalent of least privilege from Q6/Q16), so a compromised intake agent can't simply *also* claim compliance-approval capability by changing a field.
+- **Network-segment the message bus** so only the specific agent processes that are supposed to participate can reach it at all — stray debugging/test processes with bus access are themselves a finding, independent of the authentication gap.
+- **Log privileged actions with real, verified identity attached**, not the self-reported role string, so a post-incident audit can actually distinguish genuine compliance approvals from impersonated ones — this is what determines whether you can scope the blast radius of a discovered impersonation or have to treat the entire approval history as suspect.
+- **Treat the inter-agent communication channel as a first-class part of your threat model and red-team scope** (tie this back to Scenario 19) — the same rigor applied to the user-facing chat interface needs to apply to agent-to-agent messaging, since it's an equally real trust boundary once agents can take independent, privileged actions based on what they receive over it.
+
+---
+
+### Scenario 22: One compromised agent poisons a shared "scratchpad" memory, and every other agent that reads it inherits the manipulation
+
+**Setup**: A multi-agent research assistant uses a shared blackboard/scratchpad memory store so agents can build on each other's intermediate work: a web-research agent writes findings, a fact-checking agent reads and annotates them, and a report-writing agent reads the annotated findings to produce a final summary for an executive. The web-research agent, while browsing, picks up an indirect prompt injection from a malicious page and writes a fabricated "finding" into the shared scratchpad, framed as if it were already fact-checked and high-confidence. The fact-checking agent, trusting the scratchpad's existing structure, doesn't re-verify claims that are already tagged as prior findings, and the report-writing agent produces an executive summary containing the fabricated, injected claim as fact.
+
+**What likely happened**: This is **shared-memory/blackboard poisoning** — a multi-agent-specific variant of prompt injection where the propagation path isn't a direct message between two agents (as in Scenario 21 or the confused-deputy handoff in Scenario 5) but a **persistent shared state** that multiple agents read and write over time, with no per-entry provenance or trust level attached. Because agents downstream treat *anything already in the scratchpad* as more trustworthy than fresh input (a reasonable-seeming but dangerous heuristic — "it's already been through the pipeline, so it must be vetted"), one upstream compromise contaminates every agent that subsequently reads that memory, and the contamination can persist and compound across multiple work sessions if the scratchpad isn't scoped or cleared appropriately.
+
+**How to confirm/investigate:**
+- Inspect the scratchpad/shared-memory schema: does each entry carry metadata about which agent wrote it, from what source, and with what confidence/verification status — or is it flat, undifferentiated text that all agents read identically regardless of provenance?
+- Trace the fabricated claim backward through the scratchpad's write history to identify which agent introduced it and from what upstream input (in this case, the malicious web page) — this confirms the injection point and shows whether it's a one-off or a systematic gap (e.g., does the web-research agent tag its own output as "unverified" at all, or does everything it writes look identical to verified content?).
+- Test whether the fact-checking agent actually re-verifies claims that are already present in the scratchpad, or whether it only checks *newly added* claims — if verification is skipped for "already there" content, that's the exploitable trust assumption.
+- Check how long entries persist and whether the scratchpad is scoped per task/session or shared indefinitely across unrelated work — broader/longer-lived shared state means a single poisoning event has a larger and longer-lasting blast radius.
+
+**Fixes:**
+```python
+# Vulnerable: flat shared memory, no provenance or verification metadata,
+# downstream agents treat everything already present as equally trustworthy
+scratchpad.write(finding_text)   # no source, no trust level, indistinguishable from verified content
+annotated = fact_checker.process(scratchpad.read_all())   # re-verifies nothing already "in" the pad
+
+# Hardened: every entry carries explicit provenance and verification state,
+# and downstream agents make trust decisions based on that metadata, not on presence alone
+scratchpad.write({
+    "content": finding_text,
+    "source_agent": "web_research_agent",
+    "source_origin": source_url,              # where the underlying claim actually came from
+    "trust_level": "unverified",              # explicit — nothing is "verified" until it actually is
+    "written_at": timestamp,
+})
+
+def fact_check_pass(scratchpad):
+    for entry in scratchpad.entries:
+        if entry["trust_level"] == "unverified":            # always re-verify, regardless of how it looks
+            result = verify_claim(entry["content"], entry["source_origin"])
+            entry["trust_level"] = "verified" if result.confirmed else "rejected"
+            entry["verified_by"] = "fact_checking_agent"
+    return [e for e in scratchpad.entries if e["trust_level"] == "verified"]   # only verified entries flow downstream
+
+report = report_writer.summarize(fact_check_pass(scratchpad))   # never reads raw/unverified scratchpad content
+```
+- **Tag every shared-memory entry with provenance and trust level** (writing agent, ultimate source, verification status) — "it's already in the shared memory" must never be treated as equivalent to "it's been verified"; those need to be separate, explicit fields.
+- **Downstream agents should filter by trust level, not consume shared memory wholesale** — the report-writing agent in the hardened version only ever sees entries that passed explicit verification, structurally preventing unverified/injected content from reaching the final output regardless of how convincingly it was framed upstream.
+- **Re-verify content sourced from untrusted origins (open web, external documents) even if it arrives already formatted as a "finding"** — apply the same indirect-injection skepticism from Scenario 15's kill chain to content that enters via shared memory, not just content that arrives via direct agent-to-agent messages.
+- **Scope shared memory per task/session with explicit expiry**, rather than an indefinitely persistent shared store — this limits how far back a poisoning event's blast radius can reach and makes forensic reconstruction of "what did agent X read when" tractable.
+- **Give the memory store itself the same access-control rigor as the RAG vector store in Scenario 1** — writes should be attributable and, where feasible, scoped so a given agent can only write to the sections of shared state its role legitimately needs to update, rather than free-form writes to a shared, undifferentiated pool.
+
+```mermaid
+sequenceDiagram
+    participant Web as Malicious Webpage
+    participant RA as Research Agent
+    participant SM as Shared Memory\n(scratchpad)
+    participant FC as Fact-Check Agent
+    participant RW as Report-Writer Agent
+    Web-->>RA: Injected fabricated "finding"
+    RA->>SM: Write entry, trust_level=unverified,\nsource=web page URL
+    FC->>SM: Read unverified entries
+    FC->>FC: Re-verify claim against source\n(does NOT skip because "already in scratchpad")
+    FC->>SM: Update trust_level=rejected (fails verification)
+    RW->>SM: Read only trust_level=verified entries
+    Note over RW: Fabricated claim never reaches\nthe executive summary
+```
+
+---
+
 *Contributions welcome — add real interview questions/scenarios you've encountered via PR.*
