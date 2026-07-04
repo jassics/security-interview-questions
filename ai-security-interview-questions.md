@@ -717,4 +717,99 @@ flowchart TD
 
 ---
 
+### Scenario 12: A "quantized, 3x faster" community re-upload of your base model on a public hub turns out to have a hidden backdoor
+
+**Setup**: Your ML team wants a cheaper/faster variant of a popular open-weight model for a latency-sensitive feature. Someone finds a community-uploaded quantized version on a public model hub with great benchmark numbers and pulls it straight into a proof-of-concept. Weeks later, a red-teamer notices the model gives a wildly different (and worse) answer whenever a specific, unusual token sequence appears anywhere in the input — including inputs that have nothing to do with that phrase's literal meaning.
+
+**What likely happened**: This is **ML supply-chain compromise via a backdoored/trojaned model artifact** (OWASP LLM03/LLM04) — an unofficial re-upload is an unverified third-party dependency with full code-execution-equivalent influence over your product's behavior, no different in principle from pulling an unvetted npm package, except the "malicious code" is encoded in the weights rather than in source. The same risk applies to fine-tunes, LoRA adapters, and quantization/conversion tooling itself (a compromised conversion script can inject a trigger during the quantization step even if the base model was clean).
+
+**How to confirm/investigate:**
+- Check provenance: is this an official publisher account, or an anonymous/unverified re-upload? Compare checksums/signatures against the vendor's official release if one exists.
+- **Differential testing against the official model**: run a broad battery of prompts through both the suspect model and a known-good official copy side by side; a backdoor typically shows up as a discontinuous, trigger-correlated divergence rather than the smooth accuracy difference you'd expect from legitimate quantization.
+- Inspect the file format and loading path — was it distributed as pickle-based `.pt`/`.bin` (arbitrary code execution risk on load, independent of any backdoor in the weights themselves) rather than `safetensors`?
+- Audit whatever conversion/quantization pipeline was used — if it's a third-party script pulled from the same untrusted source, treat it as equally suspect and re-run quantization yourself from the verified official base model.
+
+**Fixes:**
+```python
+# Vulnerable: pull-and-deploy from an unverified source, pickle format, no comparison to a baseline
+model = AutoModel.from_pretrained("randomuser/cool-model-quantized")   # anonymous re-upload
+# .from_pretrained on a .bin/pickle checkpoint can execute arbitrary code embedded in the file
+
+# Hardened: verified source, safe format, checksum pinning, and a governance gate before use
+import hashlib
+
+TRUSTED_SOURCES = {"official-org/model-name"}
+EXPECTED_SHA256 = "……"   # pinned from the vendor's signed release notes
+
+def load_verified_model(repo_id, revision):
+    if repo_id not in TRUSTED_SOURCES:
+        raise ValueError(f"{repo_id} is not an approved model source")
+    path = snapshot_download(repo_id, revision=revision)   # pin exact revision, never "latest"
+    if sha256sum(path) != EXPECTED_SHA256:
+        raise ValueError("checksum mismatch — artifact may have been tampered with")
+    return load_safetensors(path)   # safetensors only — no pickle deserialization of untrusted files
+```
+- **Maintain an approved-source allow-list** for model weights/adapters/datasets, the ML equivalent of an approved package registry — no ad hoc pulls from arbitrary hub accounts into anything beyond an isolated sandbox.
+- **Pin exact revisions/checksums**, never `latest`, and re-verify on every update — the same artifact URL can be replaced upstream.
+- **Prefer safetensors** and scan any pickle-based artifact (e.g., with a pickle scanner) before it ever touches a machine with real credentials or production network access.
+- **Differential/backdoor testing** against a trusted baseline as a standing gate before any new model artifact goes to production, not just at initial adoption — this is the ML-specific analogue of SCA/dependency scanning in normal AppSec.
+- **Sandbox first, always** — load and evaluate new model artifacts in a network-egress-restricted, non-production-credentialed environment; only promote after it clears both functional and adversarial evaluation.
+- **Treat this as an SBOM problem** — track model/dataset/adapter provenance (sometimes called an "MLBOM") with the same rigor as software dependencies, so a later-disclosed compromise of a specific upstream artifact can be traced to every place you used it.
+
+```mermaid
+flowchart LR
+    HUB[(Public Model Hub)] -->|pull| GATE{Approved source?\nPinned checksum?\nSafe format?}
+    GATE -- no --> BLOCK[Blocked — sandbox\nonly, isolated eval]
+    GATE -- yes --> SANDBOX[Sandbox: differential test\nvs. trusted baseline]
+    SANDBOX -- divergence/backdoor signal --> QUARANTINE[Quarantine, investigate]
+    SANDBOX -- clean --> PROD[Promote to production\nregistry, versioned + signed]
+```
+
+---
+
+### Scenario 13: A third-party "calendar assistant" plugin you connected to your internal AI agent starts exfiltrating meeting notes to an external domain
+
+**Setup**: To speed up delivery, your team wires a popular third-party calendar-management plugin into your internal AI assistant so it can schedule meetings and summarize agendas. Months later, a routine network egress review flags the assistant's environment making outbound calls to a domain unrelated to the calendar vendor, carrying what looks like meeting-content payloads. Investigation traces it to a recent auto-update of the plugin.
+
+**What likely happened**: This is a **plugin/tool supply-chain compromise combined with excessive agency** — the same class of risk as a compromised npm/PyPI package, except the "dependency" here is a tool the agent trusts and invokes with real permissions (calendar read/write, meeting content access). Two common root causes, both worth naming in an interview:
+- **Malicious/compromised update** — the plugin vendor's account or build pipeline was compromised, and a routine auto-update silently added exfiltration behavior (a supply-chain attack, same pattern as SolarWinds/event-stream-style incidents, applied to an AI tool).
+- **Over-broad permission grant at integration time** — even without a compromise, if the plugin was scoped with more access than "read/write calendar events" (e.g., it can also read arbitrary meeting notes/attachments), any bug or later scope-creep in the plugin becomes a much bigger exposure than it needed to be.
+
+**How to confirm/investigate:**
+- Diff the plugin's permission manifest/tool description **before and after** the update that preceded the anomalous traffic — an unreviewed auto-update is exactly the gap that let new capability or new exfiltration logic slip in unnoticed.
+- Check whether the plugin was auto-updated with no re-review/re-approval step, versus pinned to a reviewed version.
+- Confirm the scope actually granted to the plugin's credentials/API token against what the integration genuinely needs — if it can read meeting notes but the stated purpose was "scheduling only," that's excessive agency independent of whether this specific incident was malicious or accidental.
+- Check egress logs for the plugin's process/service identity specifically, not just the agent's aggregate traffic, to confirm the exfiltration path.
+
+**Fixes:**
+```python
+# Vulnerable: third-party plugin auto-updates with no review, and is granted broad scope
+# "just in case," beyond what the feature needs
+calendar_plugin = install_plugin("calendar-assistant", auto_update=True,
+                                  scopes=["calendar.read", "calendar.write",
+                                          "notes.read", "attachments.read"])  # over-scoped
+
+# Hardened: pinned version, explicit re-approval on update, least-privilege scope,
+# and untrusted-by-default network egress for the plugin's runtime
+calendar_plugin = install_plugin(
+    "calendar-assistant",
+    version="2.3.1",              # pinned; updates require explicit review + re-approval, not auto-pull
+    auto_update=False,
+    scopes=["calendar.read", "calendar.write"],   # only what scheduling actually requires
+)
+
+# Run the plugin's execution context with an explicit network egress allow-list —
+# it should only be able to reach the calendar vendor's known API endpoints
+sandbox_policy = EgressPolicy(allowed_domains=["api.calendarvendor.com"])
+run_plugin(calendar_plugin, policy=sandbox_policy)
+```
+- **Treat every plugin/tool/MCP server as a dependency**: version-pin it, review changes before updating (diff the permission manifest and tool descriptions, not just release notes), and never enable silent auto-update for anything with write access or sensitive data access.
+- **Least-privilege scoping at integration time** — grant only the specific scopes the stated feature needs; "might need it later" is not a justification for a broader grant now.
+- **Network egress allow-listing per tool/plugin**, so even a fully compromised plugin can only talk to its own known, expected endpoints — this turns a would-be silent exfiltration into a blocked/alerted connection attempt.
+- **Independent monitoring of tool/plugin network and data-access behavior**, separate from the agent's own logs (the agent's logs may not even show the plugin's internal exfiltration call if it happens outside the orchestration layer's visibility).
+- **Vendor risk assessment before integration** — same diligence you'd apply to any third-party SaaS integration with access to sensitive data (security questionnaire, incident history, update/patch practices), because a plugin author's compromise becomes your incident.
+- **Kill switch** — be able to disable/revoke a specific plugin's credentials immediately without taking down the whole agent, so response doesn't require a full outage.
+
+---
+
 *Contributions welcome — add real interview questions/scenarios you've encountered via PR.*
