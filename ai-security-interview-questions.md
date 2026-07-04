@@ -983,4 +983,66 @@ def handle_output(response):
 
 ---
 
+### Scenario 18: A compromised preprocessing dependency in your nightly data pipeline silently backdoors every training run for weeks before anyone notices
+
+**Setup**: Your ML platform team runs a scheduled pipeline that pulls images from a mix of internal buckets and a public dataset mirror, runs them through a preprocessing library (resizing, normalization, augmentation) pulled from a public package registry, and feeds the result into a weekly model retraining job. Months later, during an unrelated dependency audit, someone notices the preprocessing library had an unreviewed patch-version auto-update that added a few lines of code silently embedding a near-invisible pixel-pattern trigger into a small percentage of images during augmentation — and cross-referencing model behavior across past releases shows every model trained since that update responds to the trigger pattern with an attacker-favorable misclassification.
+
+**What likely happened**: This is a **supply-chain attack on the training data pipeline itself**, distinct from poisoning the data's *content* (Scenario 7) or shipping a backdoored pretrained *model artifact* (Scenario 12) — here, the attacker compromised a **software component inside the pipeline** (a transitively-pulled preprocessing/augmentation dependency, auto-updated with no review) to inject the poison as data passes through, meaning the attack is invisible if you only audit the source datasets and the final model weights but never the pipeline code and its dependencies in between. This is the ML-pipeline analogue of a compromised build tool injecting malicious code into every software release it touches (SolarWinds-style), and it's especially dangerous because it poisons **every subsequent training run automatically**, with no attacker interaction needed after the initial compromise — unlike Scenario 7's feedback-loop poisoning, which required ongoing attacker activity (submitting disputes).
+
+**How to confirm/investigate:**
+- Pin down exactly when the malicious behavior started by bisecting: re-run the pipeline against historical input snapshots using different pinned versions of the preprocessing dependency, and check for the trigger pattern's appearance/disappearance across versions — this identifies the exact compromised release.
+- Diff the dependency's published source (if available) against what actually executed, and check the package registry's changelog/commit history for that version — was it a maintainer account compromise, a dependency-confusion attack (an internal-sounding package name resolved to a public malicious package instead of your internal one), or a malicious contributor slipping a change past review?
+- Audit every artifact produced by pipeline runs that used the compromised dependency version — every model trained in that window needs to be treated as potentially backdoored and either retrained from clean data or thoroughly evaluated with differential/backdoor testing (same technique as Scenario 12) before continued production use.
+- Check whether the pipeline has an SBOM/dependency manifest with pinned versions and hashes — if dependencies were unpinned (`pip install preprocess-lib` with no version constraint) or auto-updated, that's the structural gap that let this happen unnoticed.
+
+**Fixes:**
+```python
+# Vulnerable: unpinned dependency, pulled fresh on every pipeline run, no integrity check,
+# and no separation between "data has been validated" and "data has been transformed"
+# pip install preprocess-lib   (no version pin — always gets whatever is "latest" today)
+import preprocess_lib
+processed = preprocess_lib.augment(raw_images)   # runs unreviewed code from an auto-updated dependency
+train(model, processed)
+
+# Hardened: pinned + hash-verified dependencies for anything in the training pipeline,
+# treated with the same rigor as a production application dependency, plus
+# integrity checks on the data itself before and after each pipeline stage
+"""
+requirements.txt (hash-pinned, reviewed on every bump):
+preprocess-lib==4.2.1 --hash=sha256:....
+"""
+import preprocess_lib   # exact pinned version, installed only from a vetted internal mirror
+
+def run_pipeline_stage(raw_images):
+    pre_hash = content_fingerprint(raw_images)
+    processed = preprocess_lib.augment(raw_images)
+    post_hash = content_fingerprint(processed)
+    audit_log.record(stage="preprocess", dep_version="4.2.1", pre=pre_hash, post=post_hash)
+
+    if trigger_pattern_scanner.detect(processed) > POISON_THRESHOLD:   # scan output for known/anomalous
+        raise PipelineIntegrityError("anomalous transformation detected — halting before training")
+    return processed
+```
+- **Pin and hash-verify every dependency used anywhere in the training pipeline** (not just application code) — preprocessing, augmentation, tokenization, and labeling libraries are all executable code with the same supply-chain risk as any other dependency, and need the same SCA scanning and version-pinning discipline (this is exactly what the `sca-scan`/SBOM practices in normal AppSec are for, extended to the ML pipeline).
+- **Vet and mirror dependencies internally** rather than pulling directly from public registries at pipeline run time — an internal, reviewed mirror with an explicit promotion process prevents both malicious auto-updates and dependency-confusion attacks (an internal package name shadowed by a public malicious package of the same name).
+- **No silent auto-updates for anything in the training path** — every version bump for a pipeline dependency should go through the same review/approval as an application dependency bump, especially given how much harder ML-pipeline compromises are to detect after the fact.
+- **Data integrity checks between every pipeline stage**, not just at the very start and end — fingerprint/hash data before and after each transformation and scan for anomalous statistical shifts (unexpected pixel-pattern clusters, unusual embedding distribution changes) that don't correspond to the transformation's intended purpose.
+- **Treat every trained model as provisionally untrusted until it passes backdoor/differential evaluation** against a held-out clean baseline (same technique as Scenario 12) before promotion to production — this is the safety net that catches a pipeline compromise even if the dependency-level defenses above all failed.
+- **Maintain a full training-run provenance record** (which data snapshot, which pinned dependency versions/hashes, which code commit produced this model) so that when a compromise like this is discovered, you can immediately and precisely enumerate every affected model/release instead of having to assume the worst about your entire model history.
+
+```mermaid
+flowchart TD
+    SRC[Data sources:\ninternal + public mirror] --> INT1[Integrity check\n+ fingerprint]
+    INT1 --> PRE["Preprocessing dependency\n(pinned + hash-verified,\ninternal mirror only)"]
+    PRE --> INT2[Integrity check\n+ anomaly/trigger scan]
+    INT2 -- anomaly detected --> HALT[Halt pipeline,\nalert, quarantine]
+    INT2 -- clean --> TRAIN[Training job]
+    TRAIN --> PROV[Record provenance:\ndata snapshot + dep hashes + commit]
+    PROV --> EVAL[Backdoor / differential eval\nvs. clean baseline]
+    EVAL -- fail --> QUAR2[Quarantine model,\ninvestigate pipeline]
+    EVAL -- pass --> PROD[Promote to production registry]
+```
+
+---
+
 *Contributions welcome — add real interview questions/scenarios you've encountered via PR.*
